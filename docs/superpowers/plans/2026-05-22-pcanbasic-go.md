@@ -1,0 +1,3069 @@
+# pcanbasic_go v0.1.0 实施计划
+
+**Goal:** 实现 PCANBasic.dll 的 Go 封装库（Windows 专用，Linux/macOS 提供编译桩），完成双层 API、Classical+FD 收发、三种接收模式、完整测试与文档。
+
+**Architecture:** 顶层包 `pcanbasic` 提供高层 `Bus`/`Frame` API；子包 `raw` 提供 1:1 对应 PCANBasic C API 的低层绑定。Reader 单 goroutine 模型，所有底层 `Read`/`ReadFD` 调用由它独占；用户通过 `Receive()` / `ReadOne()` / `TryRead()` 从 rxCh 取数据。
+
+**Tech Stack:** Go 1.22+；`golang.org/x/sys/windows`；`PCANBasic.dll`（PEAK 官方）。
+
+**Spec：** `docs/superpowers/specs/2026-05-22-pcanbasic-go-design.md`
+
+---
+
+## 文件结构总览
+
+```
+github.com/Crush251/pcanbasic_go
+├── doc.go                         # 包级 godoc 总览（中文）
+├── pcanbasic.go                   # Open / OpenFD 顶层入口
+├── bus.go                         # Bus 类型 + reader goroutine
+├── frame.go                       # Frame + 构造器
+├── options.go                     # Option 模式
+├── errors.go                      # *Error + 哨兵 + SendManyError
+├── status.go                      # Status (alias)
+├── adapter.go                     # rawAdapter 接口 + liveAdapter
+├── logger.go                      # Logger 接口 + noopLogger
+├── frame_test.go
+├── errors_test.go
+├── status_test.go
+├── options_test.go
+├── bus_test.go
+├── adapter_fake_test.go           # 测试 fake adapter（不导出）
+├── raw/
+│   ├── doc.go
+│   ├── consts.go                  # PCAN_USBBUS1.. / PCAN_BAUD_1M.. / 错误码
+│   ├── types.go                   # TPCAN* 类型
+│   ├── api.go                     # 跨平台的导出函数签名 + 文档（无 build tag，纯文档载体）—— 实际未引入，使用 windows/other 文件
+│   ├── api_windows.go             # syscall 实现
+│   ├── api_other.go               # 非 Windows 桩
+│   └── api_test.go                # 常量/类型/编译校验
+├── examples/                      # 10 个示例
+│   ├── 01_send_classical/main.go
+│   ├── 02_receive_polling/main.go
+│   ├── 03_receive_event/main.go
+│   ├── 04_send_fd/main.go
+│   ├── 05_receive_fd/main.go
+│   ├── 06_multi_channel/main.go
+│   ├── 07_filter/main.go
+│   ├── 08_status_and_reset/main.go
+│   ├── 09_with_logger/main.go
+│   └── 10_using_raw/main.go
+├── docs/                          # 已存在 spec；新增以下文件
+│   ├── quickstart.md
+│   ├── architecture.md
+│   ├── can-fd.md
+│   ├── error-handling.md
+│   ├── platform-support.md
+│   ├── hardware-test-setup.md
+│   └── troubleshooting.md
+└── .github/workflows/ci.yml
+```
+
+---
+
+## 阶段 1：raw 子包（C API 1:1 绑定）
+
+**目标**：先把底层打通。raw 是后续所有层的依赖。
+
+**文件**：
+- `raw/doc.go` — 包级中文文档、稳定性声明、DLL 路径策略
+- `raw/consts.go` — Channel/Baudrate/错误码/MsgType/Parameter 常量（与 PCANBasic.h 对齐）
+- `raw/types.go` — `TPCANHandle/Status/Baudrate/MessageType/Parameter/...` 类型；`TPCANMsg/TPCANMsgFD/TPCANTimestamp` 结构
+- `raw/api_windows.go` — syscall 实现 + `EnsureLoaded` + DLL 路径搜索
+- `raw/api_other.go` — 非 Windows 桩，全部返回 `PCAN_ERROR_ILLOPERATION`
+- `raw/api_test.go` — 常量值、`unsafe.Offsetof` 校验、签名编译校验（**不调用 procX.Call**）
+
+**关键常量**（按 PCANBasic.h，截至撰写时官方版本）：
+
+```go
+// channels (节选)
+const (
+    PCAN_NONEBUS  TPCANHandle = 0x00
+    PCAN_USBBUS1  TPCANHandle = 0x51
+    PCAN_USBBUS2  TPCANHandle = 0x52
+    PCAN_USBBUS3  TPCANHandle = 0x53
+    PCAN_USBBUS4  TPCANHandle = 0x54
+    PCAN_USBBUS5  TPCANHandle = 0x55
+    PCAN_USBBUS6  TPCANHandle = 0x56
+    PCAN_USBBUS7  TPCANHandle = 0x57
+    PCAN_USBBUS8  TPCANHandle = 0x58
+    PCAN_USBBUS9  TPCANHandle = 0x509
+    PCAN_USBBUS10 TPCANHandle = 0x50A
+    PCAN_USBBUS11 TPCANHandle = 0x50B
+    PCAN_USBBUS12 TPCANHandle = 0x50C
+    PCAN_USBBUS13 TPCANHandle = 0x50D
+    PCAN_USBBUS14 TPCANHandle = 0x50E
+    PCAN_USBBUS15 TPCANHandle = 0x50F
+    PCAN_USBBUS16 TPCANHandle = 0x510
+)
+
+// baudrates
+const (
+    PCAN_BAUD_1M    TPCANBaudrate = 0x0014
+    PCAN_BAUD_800K  TPCANBaudrate = 0x0016
+    PCAN_BAUD_500K  TPCANBaudrate = 0x001C
+    PCAN_BAUD_250K  TPCANBaudrate = 0x011C
+    PCAN_BAUD_125K  TPCANBaudrate = 0x031C
+    PCAN_BAUD_100K  TPCANBaudrate = 0x432F
+    PCAN_BAUD_95K   TPCANBaudrate = 0xC34E
+    PCAN_BAUD_83K   TPCANBaudrate = 0x852B
+    PCAN_BAUD_50K   TPCANBaudrate = 0x472F
+    PCAN_BAUD_47K   TPCANBaudrate = 0x1414
+    PCAN_BAUD_33K   TPCANBaudrate = 0x8B2F
+    PCAN_BAUD_20K   TPCANBaudrate = 0x532F
+    PCAN_BAUD_10K   TPCANBaudrate = 0x672F
+    PCAN_BAUD_5K    TPCANBaudrate = 0x7F7F
+)
+
+// error codes
+const (
+    PCAN_ERROR_OK           TPCANStatus = 0x00000
+    PCAN_ERROR_XMTFULL      TPCANStatus = 0x00001
+    PCAN_ERROR_OVERRUN      TPCANStatus = 0x00002
+    PCAN_ERROR_BUSLIGHT     TPCANStatus = 0x00004
+    PCAN_ERROR_BUSHEAVY     TPCANStatus = 0x00008
+    PCAN_ERROR_BUSWARNING   TPCANStatus = 0x00008
+    PCAN_ERROR_BUSPASSIVE   TPCANStatus = 0x40000
+    PCAN_ERROR_BUSOFF       TPCANStatus = 0x00010
+    PCAN_ERROR_ANYBUSERR    TPCANStatus = PCAN_ERROR_BUSWARNING | PCAN_ERROR_BUSLIGHT | PCAN_ERROR_BUSHEAVY | PCAN_ERROR_BUSOFF | PCAN_ERROR_BUSPASSIVE
+    PCAN_ERROR_QRCVEMPTY    TPCANStatus = 0x00020
+    PCAN_ERROR_QOVERRUN     TPCANStatus = 0x00040
+    PCAN_ERROR_QXMTFULL     TPCANStatus = 0x00080
+    PCAN_ERROR_REGTEST      TPCANStatus = 0x00100
+    PCAN_ERROR_NODRIVER     TPCANStatus = 0x00200
+    PCAN_ERROR_HWINUSE      TPCANStatus = 0x00400
+    PCAN_ERROR_NETINUSE     TPCANStatus = 0x00800
+    PCAN_ERROR_ILLHW        TPCANStatus = 0x01400
+    PCAN_ERROR_ILLNET       TPCANStatus = 0x01800
+    PCAN_ERROR_ILLCLIENT    TPCANStatus = 0x01C00
+    PCAN_ERROR_ILLHANDLE    TPCANStatus = PCAN_ERROR_ILLHW | PCAN_ERROR_ILLNET | PCAN_ERROR_ILLCLIENT
+    PCAN_ERROR_RESOURCE     TPCANStatus = 0x02000
+    PCAN_ERROR_ILLPARAMTYPE TPCANStatus = 0x04000
+    PCAN_ERROR_ILLPARAMVAL  TPCANStatus = 0x08000
+    PCAN_ERROR_UNKNOWN      TPCANStatus = 0x10000
+    PCAN_ERROR_ILLDATA      TPCANStatus = 0x20000
+    PCAN_ERROR_ILLOPERATION TPCANStatus = 0x80000
+    PCAN_ERROR_INITIALIZE   TPCANStatus = 0x4000000
+)
+
+// message types
+const (
+    PCAN_MESSAGE_STANDARD TPCANMessageType = 0x00
+    PCAN_MESSAGE_RTR      TPCANMessageType = 0x01
+    PCAN_MESSAGE_EXTENDED TPCANMessageType = 0x02
+    PCAN_MESSAGE_FD       TPCANMessageType = 0x04
+    PCAN_MESSAGE_BRS      TPCANMessageType = 0x08
+    PCAN_MESSAGE_ESI      TPCANMessageType = 0x10
+    PCAN_MESSAGE_ECHO     TPCANMessageType = 0x20
+    PCAN_MESSAGE_ERRFRAME TPCANMessageType = 0x40
+    PCAN_MESSAGE_STATUS   TPCANMessageType = 0x80
+)
+
+// parameters (节选 v0.1 用得到的)
+const (
+    PCAN_RECEIVE_EVENT      TPCANParameter = 0x03
+    PCAN_MESSAGE_FILTER     TPCANParameter = 0x04
+    PCAN_API_VERSION        TPCANParameter = 0x05
+    PCAN_CHANNEL_VERSION    TPCANParameter = 0x06
+    PCAN_BUSOFF_AUTORESET   TPCANParameter = 0x07
+    PCAN_ALLOW_STATUS_FRAMES TPCANParameter = 0x14
+    PCAN_ALLOW_RTR_FRAMES   TPCANParameter = 0x15
+    PCAN_ALLOW_ERROR_FRAMES TPCANParameter = 0x16
+)
+
+// filter modes
+const (
+    PCAN_FILTER_CLOSE  TPCANParameter = 0
+    PCAN_FILTER_OPEN   TPCANParameter = 1
+    PCAN_FILTER_CUSTOM TPCANParameter = 2
+)
+
+// languages for GetErrorText
+const (
+    LanguageNeutral uint16 = 0x00
+    LanguageEnglish uint16 = 0x09
+    LanguageGerman  uint16 = 0x07
+    LanguageSpanish uint16 = 0x0A
+    LanguageItalian uint16 = 0x10
+    LanguageFrench  uint16 = 0x0C
+)
+```
+
+**关键调用约定**：
+
+- DLL：默认 `PCANBasic.dll`，可通过环境变量 `PCANBASIC_DLL_PATH` 覆盖
+- 函数符号名：`CAN_Initialize / CAN_InitializeFD / CAN_Uninitialize / CAN_Reset / CAN_Read / CAN_ReadFD / CAN_Write / CAN_WriteFD / CAN_GetStatus / CAN_GetErrorText / CAN_FilterMessages / CAN_GetValue / CAN_SetValue`
+- 加载策略：`sync.Once` + 失败标记；任一函数检测到 `procX == nil` 返回 `PCAN_ERROR_NODRIVER`
+
+### Task 1.1：raw/doc.go
+
+**Files:**
+- Create: `raw/doc.go`
+
+- [ ] **Step 1：写文件**
+
+```go
+// Package raw 提供 PCANBasic.dll C API 的零开销 Go 绑定。
+//
+// 本包按 PCAN-Basic 官方头文件 PCANBasic.h 进行 1:1 映射，
+// 适合需要 PCAN 特殊功能（Trace、Flash、设备信息查询、任意 Parameter 读写等）
+// 或需要在 pcanbasic 顶层包之外自行做更高层封装的用户。
+//
+// 大多数应用建议直接使用顶层 github.com/Crush251/pcanbasic_go 包。
+//
+// # 平台
+//
+// 仅 Windows 真实工作；其他平台所有函数返回 PCAN_ERROR_ILLOPERATION，
+// 由高层映射为 ErrNotSupported，便于在 Linux/macOS 上做 lint / vet / 单元测试。
+//
+// # DLL 加载
+//
+// 默认从进程当前目录及 Windows 标准 DLL 搜索路径加载 "PCANBasic.dll"。
+// 可通过设置环境变量 PCANBASIC_DLL_PATH 指向具体 DLL 文件覆盖。
+//
+// 注意：Go 程序 GOARCH 必须与 DLL 位数一致（amd64 → 64 位 DLL；386 → 32 位 DLL）。
+//
+// # 稳定性
+//
+// 在 v1.0.0 之前，本包签名跟随 PCANBasic 官方头文件演进可能发生小幅调整；
+// 顶层 pcanbasic 包提供稳定的高层抽象。
+package raw
+```
+
+- [ ] **Step 2：commit**
+
+```bash
+git add raw/doc.go
+git commit -m "feat(raw): add package doc"
+```
+
+### Task 1.2：raw/types.go + consts.go
+
+**Files:**
+- Create: `raw/types.go`
+- Create: `raw/consts.go`
+
+- [ ] **Step 1：types.go**
+
+```go
+package raw
+
+// 与 PCANBasic.h 对应的基础类型。
+type (
+    TPCANHandle      uint16
+    TPCANStatus      uint32
+    TPCANBaudrate    uint16
+    TPCANType        uint8
+    TPCANMessageType uint8
+    TPCANParameter   uint8
+    TPCANTimestampFD = uint64
+)
+
+// TPCANMsg 字段顺序与 C 结构 TPCANMsg 一致。
+//
+// 注意：因 Go 自然对齐规则，unsafe.Sizeof(TPCANMsg{}) 可能为 16 而非 C 的 14。
+// 这不影响 PCANBasic 调用 —— DLL 仅访问前 14 字节，尾部 padding 是 Go 自有内存，
+// 对端不感知。
+type TPCANMsg struct {
+    ID      uint32
+    MsgType TPCANMessageType
+    Len     uint8
+    Data    [8]byte
+}
+
+// TPCANMsgFD 与 C 结构 TPCANMsgFD 字段对应。
+type TPCANMsgFD struct {
+    ID      uint32
+    MsgType TPCANMessageType
+    DLC     uint8
+    Data    [64]byte
+}
+
+// TPCANTimestamp 与 C 结构 TPCANTimestamp 字段对应。
+type TPCANTimestamp struct {
+    Millis         uint32
+    MillisOverflow uint16
+    Micros         uint16
+}
+```
+
+- [ ] **Step 2：consts.go**（按上面列出的常量清单 + 注释）
+
+```go
+package raw
+
+// PCAN 通道句柄。
+const (
+    PCAN_NONEBUS  TPCANHandle = 0x00
+    PCAN_USBBUS1  TPCANHandle = 0x51
+    PCAN_USBBUS2  TPCANHandle = 0x52
+    // ... 完整列出 PCAN_USBBUS3..PCAN_USBBUS16，PCIBus、LANBus
+)
+
+// Classical CAN 波特率。
+const (
+    PCAN_BAUD_1M    TPCANBaudrate = 0x0014
+    // ...
+)
+
+// 错误码（位掩码）。
+const (
+    PCAN_ERROR_OK         TPCANStatus = 0x00000
+    PCAN_ERROR_XMTFULL    TPCANStatus = 0x00001
+    // ...
+)
+
+// 帧类型位。
+const (
+    PCAN_MESSAGE_STANDARD TPCANMessageType = 0x00
+    // ...
+)
+
+// SetValue/GetValue 的参数。
+const (
+    PCAN_RECEIVE_EVENT TPCANParameter = 0x03
+    // ...
+)
+
+// GetErrorText 语言。
+const (
+    LanguageNeutral uint16 = 0x00
+    LanguageEnglish uint16 = 0x09
+    // ...
+)
+```
+
+- [ ] **Step 3：commit**
+
+```bash
+git add raw/types.go raw/consts.go
+git commit -m "feat(raw): add PCAN types and constants"
+```
+
+### Task 1.3：raw/api_other.go（非 Windows 桩）
+
+**Files:**
+- Create: `raw/api_other.go`
+
+- [ ] **Step 1：写文件**
+
+```go
+//go:build !windows
+
+package raw
+
+import "unsafe"
+
+// EnsureLoaded 在非 Windows 平台总是返回 nil；后续所有调用返回 PCAN_ERROR_ILLOPERATION。
+// 设计意图：让 Linux/macOS 上的 lint / vet / 纯逻辑单测可以正常编译运行。
+func EnsureLoaded() error { return nil }
+
+func Initialize(ch TPCANHandle, br TPCANBaudrate) TPCANStatus {
+    return PCAN_ERROR_ILLOPERATION
+}
+
+func InitializeFD(ch TPCANHandle, bitrateFD string) TPCANStatus {
+    return PCAN_ERROR_ILLOPERATION
+}
+
+func Uninitialize(ch TPCANHandle) TPCANStatus                   { return PCAN_ERROR_ILLOPERATION }
+func Reset(ch TPCANHandle) TPCANStatus                          { return PCAN_ERROR_ILLOPERATION }
+func GetStatus(ch TPCANHandle) TPCANStatus                      { return PCAN_ERROR_ILLOPERATION }
+func Read(ch TPCANHandle, m *TPCANMsg, t *TPCANTimestamp) TPCANStatus  { return PCAN_ERROR_ILLOPERATION }
+func ReadFD(ch TPCANHandle, m *TPCANMsgFD, t *TPCANTimestampFD) TPCANStatus { return PCAN_ERROR_ILLOPERATION }
+func Write(ch TPCANHandle, m *TPCANMsg) TPCANStatus             { return PCAN_ERROR_ILLOPERATION }
+func WriteFD(ch TPCANHandle, m *TPCANMsgFD) TPCANStatus         { return PCAN_ERROR_ILLOPERATION }
+func FilterMessages(ch TPCANHandle, fromID, toID uint32, mode TPCANMessageType) TPCANStatus {
+    return PCAN_ERROR_ILLOPERATION
+}
+func GetValue(ch TPCANHandle, p TPCANParameter, buf unsafe.Pointer, n uint32) TPCANStatus {
+    return PCAN_ERROR_ILLOPERATION
+}
+func SetValue(ch TPCANHandle, p TPCANParameter, buf unsafe.Pointer, n uint32) TPCANStatus {
+    return PCAN_ERROR_ILLOPERATION
+}
+func GetErrorText(code TPCANStatus, lang uint16) (string, TPCANStatus) {
+    return "", PCAN_ERROR_ILLOPERATION
+}
+```
+
+- [ ] **Step 2：commit**
+
+```bash
+git add raw/api_other.go
+git commit -m "feat(raw): add non-Windows stub implementation"
+```
+
+### Task 1.4：raw/api_windows.go（syscall 实现）
+
+**Files:**
+- Create: `raw/api_windows.go`
+
+实现要点：
+
+- `windows.NewLazyDLL(path)` 懒加载
+- `loadErr` 记录 `Find()` 错误；任一 API 调用前判 `loadErr != nil`，返回 `PCAN_ERROR_NODRIVER`
+- `Call` 返回的 `uintptr` 强转 `TPCANStatus`
+- 字符串参数用 `windows.BytePtrFromString` + `unsafe.Pointer`
+- `GetErrorText` 输出缓冲 256 字节 `[256]byte`，调用后取 NUL 截断
+
+```go
+//go:build windows
+
+package raw
+
+import (
+    "fmt"
+    "os"
+    "sync"
+    "unsafe"
+
+    "golang.org/x/sys/windows"
+)
+
+var (
+    loadOnce sync.Once
+    loadErr  error
+
+    dll *windows.LazyDLL
+
+    procInitialize     *windows.LazyProc
+    procInitializeFD   *windows.LazyProc
+    procUninitialize   *windows.LazyProc
+    procReset          *windows.LazyProc
+    procGetStatus      *windows.LazyProc
+    procRead           *windows.LazyProc
+    procReadFD         *windows.LazyProc
+    procWrite          *windows.LazyProc
+    procWriteFD        *windows.LazyProc
+    procFilterMessages *windows.LazyProc
+    procGetValue       *windows.LazyProc
+    procSetValue       *windows.LazyProc
+    procGetErrorText   *windows.LazyProc
+)
+
+// EnsureLoaded 显式触发 PCANBasic.dll 的加载。
+func EnsureLoaded() error {
+    loadOnce.Do(func() {
+        path := os.Getenv("PCANBASIC_DLL_PATH")
+        if path == "" {
+            path = "PCANBasic.dll"
+        }
+        dll = windows.NewLazyDLL(path)
+        if err := dll.Load(); err != nil {
+            loadErr = fmt.Errorf("load PCANBasic dll %q: %w", path, err)
+            return
+        }
+        procInitialize     = dll.NewProc("CAN_Initialize")
+        procInitializeFD   = dll.NewProc("CAN_InitializeFD")
+        procUninitialize   = dll.NewProc("CAN_Uninitialize")
+        procReset          = dll.NewProc("CAN_Reset")
+        procGetStatus      = dll.NewProc("CAN_GetStatus")
+        procRead           = dll.NewProc("CAN_Read")
+        procReadFD         = dll.NewProc("CAN_ReadFD")
+        procWrite          = dll.NewProc("CAN_Write")
+        procWriteFD        = dll.NewProc("CAN_WriteFD")
+        procFilterMessages = dll.NewProc("CAN_FilterMessages")
+        procGetValue       = dll.NewProc("CAN_GetValue")
+        procSetValue       = dll.NewProc("CAN_SetValue")
+        procGetErrorText   = dll.NewProc("CAN_GetErrorText")
+    })
+    return loadErr
+}
+
+func ensure() bool {
+    if err := EnsureLoaded(); err != nil {
+        return false
+    }
+    return true
+}
+
+func Initialize(ch TPCANHandle, br TPCANBaudrate) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procInitialize.Call(uintptr(ch), uintptr(br), 0, 0, 0)
+    return TPCANStatus(r)
+}
+
+func InitializeFD(ch TPCANHandle, bitrateFD string) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    b, err := windows.BytePtrFromString(bitrateFD)
+    if err != nil {
+        return PCAN_ERROR_ILLPARAMVAL
+    }
+    r, _, _ := procInitializeFD.Call(uintptr(ch), uintptr(unsafe.Pointer(b)))
+    return TPCANStatus(r)
+}
+
+func Uninitialize(ch TPCANHandle) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procUninitialize.Call(uintptr(ch))
+    return TPCANStatus(r)
+}
+
+func Reset(ch TPCANHandle) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procReset.Call(uintptr(ch))
+    return TPCANStatus(r)
+}
+
+func GetStatus(ch TPCANHandle) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procGetStatus.Call(uintptr(ch))
+    return TPCANStatus(r)
+}
+
+func Read(ch TPCANHandle, m *TPCANMsg, t *TPCANTimestamp) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procRead.Call(uintptr(ch),
+        uintptr(unsafe.Pointer(m)),
+        uintptr(unsafe.Pointer(t)))
+    return TPCANStatus(r)
+}
+
+func ReadFD(ch TPCANHandle, m *TPCANMsgFD, t *TPCANTimestampFD) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procReadFD.Call(uintptr(ch),
+        uintptr(unsafe.Pointer(m)),
+        uintptr(unsafe.Pointer(t)))
+    return TPCANStatus(r)
+}
+
+func Write(ch TPCANHandle, m *TPCANMsg) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procWrite.Call(uintptr(ch), uintptr(unsafe.Pointer(m)))
+    return TPCANStatus(r)
+}
+
+func WriteFD(ch TPCANHandle, m *TPCANMsgFD) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procWriteFD.Call(uintptr(ch), uintptr(unsafe.Pointer(m)))
+    return TPCANStatus(r)
+}
+
+func FilterMessages(ch TPCANHandle, fromID, toID uint32, mode TPCANMessageType) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procFilterMessages.Call(
+        uintptr(ch), uintptr(fromID), uintptr(toID), uintptr(mode))
+    return TPCANStatus(r)
+}
+
+func GetValue(ch TPCANHandle, p TPCANParameter, buf unsafe.Pointer, n uint32) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procGetValue.Call(uintptr(ch), uintptr(p), uintptr(buf), uintptr(n))
+    return TPCANStatus(r)
+}
+
+func SetValue(ch TPCANHandle, p TPCANParameter, buf unsafe.Pointer, n uint32) TPCANStatus {
+    if !ensure() {
+        return PCAN_ERROR_NODRIVER
+    }
+    r, _, _ := procSetValue.Call(uintptr(ch), uintptr(p), uintptr(buf), uintptr(n))
+    return TPCANStatus(r)
+}
+
+func GetErrorText(code TPCANStatus, lang uint16) (string, TPCANStatus) {
+    if !ensure() {
+        return "", PCAN_ERROR_NODRIVER
+    }
+    var buf [256]byte
+    r, _, _ := procGetErrorText.Call(uintptr(code), uintptr(lang),
+        uintptr(unsafe.Pointer(&buf[0])))
+    status := TPCANStatus(r)
+    if status != PCAN_ERROR_OK {
+        return "", status
+    }
+    // C 字符串以 NUL 结尾
+    n := 0
+    for n < len(buf) && buf[n] != 0 {
+        n++
+    }
+    return string(buf[:n]), PCAN_ERROR_OK
+}
+```
+
+- [ ] **Step 2：commit**
+
+```bash
+git add raw/api_windows.go
+git commit -m "feat(raw): add Windows syscall bindings"
+```
+
+### Task 1.5：raw/api_test.go（编译 + 常量校验，不真调）
+
+**Files:**
+- Create: `raw/api_test.go`
+
+```go
+package raw
+
+import (
+    "testing"
+    "unsafe"
+)
+
+func TestConstants_PCANStatus(t *testing.T) {
+    cases := []struct {
+        name string
+        got  TPCANStatus
+        want uint32
+    }{
+        {"OK", PCAN_ERROR_OK, 0x00000},
+        {"BUSOFF", PCAN_ERROR_BUSOFF, 0x00010},
+        {"QRCVEMPTY", PCAN_ERROR_QRCVEMPTY, 0x00020},
+        {"QOVERRUN", PCAN_ERROR_QOVERRUN, 0x00040},
+        {"QXMTFULL", PCAN_ERROR_QXMTFULL, 0x00080},
+        {"BUSPASSIVE", PCAN_ERROR_BUSPASSIVE, 0x40000},
+        {"ILLPARAMVAL", PCAN_ERROR_ILLPARAMVAL, 0x08000},
+        {"ILLOPERATION", PCAN_ERROR_ILLOPERATION, 0x80000},
+        {"INITIALIZE", PCAN_ERROR_INITIALIZE, 0x4000000},
+    }
+    for _, c := range cases {
+        if uint32(c.got) != c.want {
+            t.Errorf("%s = 0x%X, want 0x%X", c.name, uint32(c.got), c.want)
+        }
+    }
+}
+
+func TestConstants_USBChannels(t *testing.T) {
+    if PCAN_USBBUS1 != 0x51 {
+        t.Errorf("PCAN_USBBUS1 = 0x%X, want 0x51", PCAN_USBBUS1)
+    }
+    if PCAN_USBBUS16 != 0x510 {
+        t.Errorf("PCAN_USBBUS16 = 0x%X, want 0x510", PCAN_USBBUS16)
+    }
+}
+
+func TestConstants_Baudrate(t *testing.T) {
+    if PCAN_BAUD_1M != 0x0014 {
+        t.Errorf("PCAN_BAUD_1M = 0x%X, want 0x0014", PCAN_BAUD_1M)
+    }
+    if PCAN_BAUD_500K != 0x001C {
+        t.Errorf("PCAN_BAUD_500K = 0x%X, want 0x001C", PCAN_BAUD_500K)
+    }
+}
+
+// TPCANMsg 字段偏移必须严格与 C 结构匹配，否则 PCANBasic.dll 写入数据时会错位。
+func TestTPCANMsg_FieldOffsets(t *testing.T) {
+    var m TPCANMsg
+    if unsafe.Offsetof(m.ID) != 0 {
+        t.Errorf("ID offset = %d, want 0", unsafe.Offsetof(m.ID))
+    }
+    if unsafe.Offsetof(m.MsgType) != 4 {
+        t.Errorf("MsgType offset = %d, want 4", unsafe.Offsetof(m.MsgType))
+    }
+    if unsafe.Offsetof(m.Len) != 5 {
+        t.Errorf("Len offset = %d, want 5", unsafe.Offsetof(m.Len))
+    }
+    if unsafe.Offsetof(m.Data) != 6 {
+        t.Errorf("Data offset = %d, want 6", unsafe.Offsetof(m.Data))
+    }
+}
+
+func TestTPCANMsgFD_FieldOffsets(t *testing.T) {
+    var m TPCANMsgFD
+    if unsafe.Offsetof(m.ID) != 0 {
+        t.Errorf("ID offset = %d, want 0", unsafe.Offsetof(m.ID))
+    }
+    if unsafe.Offsetof(m.MsgType) != 4 {
+        t.Errorf("MsgType offset = %d, want 4", unsafe.Offsetof(m.MsgType))
+    }
+    if unsafe.Offsetof(m.DLC) != 5 {
+        t.Errorf("DLC offset = %d, want 5", unsafe.Offsetof(m.DLC))
+    }
+    if unsafe.Offsetof(m.Data) != 6 {
+        t.Errorf("Data offset = %d, want 6", unsafe.Offsetof(m.Data))
+    }
+}
+
+// 验证非 Windows 平台桩函数返回 PCAN_ERROR_ILLOPERATION。
+// 在 Windows 上由于 DLL 可能不存在，会返回 PCAN_ERROR_NODRIVER；
+// 两种情况都是预期"不可用"，我们只接受这两种状态码之一。
+func TestStubReturns_OnNonHardware(t *testing.T) {
+    status := Initialize(PCAN_USBBUS1, PCAN_BAUD_1M)
+    if status != PCAN_ERROR_ILLOPERATION && status != PCAN_ERROR_NODRIVER {
+        t.Errorf("Initialize without hardware/DLL returned 0x%X, want ILLOPERATION or NODRIVER",
+            uint32(status))
+    }
+    _ = Uninitialize(PCAN_USBBUS1)
+}
+```
+
+- [ ] **Step 2：跑测试 + commit**
+
+```bash
+go test ./raw/... -v
+git add raw/api_test.go
+git commit -m "test(raw): add constants and struct offset tests"
+```
+
+### 阶段 1 出口条件
+
+- `go build ./...` 通过
+- `go test ./raw/... -race` 通过
+- `go vet ./...` 通过
+
+---
+
+## 阶段 2：基础类型层（Frame / Status / Error / Logger）
+
+**目标**：高层类型 + 完整单测，不依赖 Bus 也不依赖真实 raw 调用。
+
+### Task 2.1：errors.go
+
+**Files:**
+- Create: `errors.go`
+
+```go
+package pcanbasic
+
+import (
+    "errors"
+    "fmt"
+
+    "github.com/Crush251/pcanbasic_go/raw"
+)
+
+// 库内部错误（参数校验、状态等）。
+var (
+    ErrIDOutOfRange        = errors.New("pcanbasic: CAN ID out of range")
+    ErrDataTooLong         = errors.New("pcanbasic: data length exceeds capacity")
+    ErrInvalidFDLength     = errors.New("pcanbasic: invalid CAN FD data length")
+    ErrRemoteOnFD          = errors.New("pcanbasic: remote frame not allowed on CAN FD")
+    ErrBusClosed           = errors.New("pcanbasic: bus is closed")
+    ErrNotSupported        = errors.New("pcanbasic: operation not supported on this platform")
+    ErrDLLNotFound         = errors.New("pcanbasic: PCANBasic.dll not found or failed to load")
+    ErrFDNotSupportedOnBus = errors.New("pcanbasic: FD frame requires a bus opened with OpenFD")
+)
+
+// 队列状态。
+var (
+    ErrQueueEmpty   = errors.New("pcanbasic: receive queue empty")
+    ErrQueueOverrun = errors.New("pcanbasic: receive queue overrun")
+    ErrQueueXmtFull = errors.New("pcanbasic: transmit queue full")
+)
+
+// 总线状态。
+var (
+    ErrBusLight   = errors.New("pcanbasic: bus light")
+    ErrBusHeavy   = errors.New("pcanbasic: bus heavy")
+    ErrBusPassive = errors.New("pcanbasic: bus passive")
+    ErrBusOff     = errors.New("pcanbasic: bus off")
+)
+
+// API / 驱动。
+var (
+    ErrNotInitialized = errors.New("pcanbasic: channel not initialized")
+    ErrIllHandle      = errors.New("pcanbasic: invalid channel handle")
+    ErrIllParamType   = errors.New("pcanbasic: invalid parameter type")
+    ErrIllParamValue  = errors.New("pcanbasic: invalid parameter value")
+    ErrIllOperation   = errors.New("pcanbasic: illegal operation")
+    ErrNoDriver       = errors.New("pcanbasic: driver not loaded")
+    ErrUnknown        = errors.New("pcanbasic: unknown error")
+)
+
+// Error 是一次 PCAN API 调用产生的错误。
+type Error struct {
+    Code raw.TPCANStatus // 原始 PCAN 错误位掩码
+    Op   string          // 触发错误的操作，如 "CAN_Initialize"
+    Msg  string          // 通过 CAN_GetErrorText 取到的可读描述（可能为空）
+}
+
+func (e *Error) Error() string {
+    if e.Msg != "" {
+        return fmt.Sprintf("pcanbasic: %s failed: 0x%08X: %s",
+            e.Op, uint32(e.Code), e.Msg)
+    }
+    return fmt.Sprintf("pcanbasic: %s failed: 0x%08X", e.Op, uint32(e.Code))
+}
+
+// Has 判断错误码中是否包含某个具体错误位。
+// 特别处理 PCAN_ERROR_OK (0)：仅当 e.Code 也是 0 时才算"包含"。
+func (e *Error) Has(code raw.TPCANStatus) bool {
+    if code == raw.PCAN_ERROR_OK {
+        return e.Code == raw.PCAN_ERROR_OK
+    }
+    return e.Code&code == code
+}
+
+// Is 让一个 *Error 可以同时匹配多个哨兵错误（位掩码语义）。
+func (e *Error) Is(target error) bool {
+    switch target {
+    case ErrQueueEmpty:
+        return e.Has(raw.PCAN_ERROR_QRCVEMPTY)
+    case ErrQueueOverrun:
+        return e.Has(raw.PCAN_ERROR_QOVERRUN)
+    case ErrQueueXmtFull:
+        return e.Has(raw.PCAN_ERROR_QXMTFULL)
+    case ErrBusLight:
+        return e.Has(raw.PCAN_ERROR_BUSLIGHT)
+    case ErrBusHeavy:
+        return e.Has(raw.PCAN_ERROR_BUSHEAVY)
+    case ErrBusPassive:
+        return e.Has(raw.PCAN_ERROR_BUSPASSIVE)
+    case ErrBusOff:
+        return e.Has(raw.PCAN_ERROR_BUSOFF)
+    case ErrNotInitialized:
+        return e.Has(raw.PCAN_ERROR_INITIALIZE)
+    case ErrIllHandle:
+        return e.Has(raw.PCAN_ERROR_ILLHANDLE)
+    case ErrIllParamValue:
+        return e.Has(raw.PCAN_ERROR_ILLPARAMVAL)
+    case ErrIllParamType:
+        return e.Has(raw.PCAN_ERROR_ILLPARAMTYPE)
+    case ErrIllOperation:
+        return e.Has(raw.PCAN_ERROR_ILLOPERATION)
+    case ErrNoDriver:
+        return e.Has(raw.PCAN_ERROR_NODRIVER)
+    }
+    return false
+}
+
+// SendManyError 标识 SendMany 中第 Index 帧（0-based）发送失败。
+type SendManyError struct {
+    Index int    // 失败的帧下标
+    Frame Frame  // 失败的帧本身（深拷贝）
+    Err   error  // 底层错误
+}
+
+func (e *SendManyError) Error() string {
+    return fmt.Sprintf("pcanbasic: SendMany failed at frame[%d]: %v", e.Index, e.Err)
+}
+
+func (e *SendManyError) Unwrap() error { return e.Err }
+
+// newError 是给内部代码构造 *Error 的快捷工厂。
+// 调用方负责传 op；msg 通常由 raw.GetErrorText 填充，调用方决定何时调用。
+func newError(op string, code raw.TPCANStatus) *Error {
+    msg, _ := raw.GetErrorText(code, raw.LanguageEnglish)
+    return &Error{Code: code, Op: op, Msg: msg}
+}
+```
+
+### Task 2.2：errors_test.go
+
+**Files:**
+- Create: `errors_test.go`
+
+```go
+package pcanbasic
+
+import (
+    "errors"
+    "testing"
+
+    "github.com/Crush251/pcanbasic_go/raw"
+)
+
+func TestError_Has_OKBoundary(t *testing.T) {
+    e := &Error{Code: raw.PCAN_ERROR_BUSOFF}
+    if e.Has(raw.PCAN_ERROR_OK) {
+        t.Error("Has(OK) on non-OK error should be false")
+    }
+
+    ok := &Error{Code: raw.PCAN_ERROR_OK}
+    if !ok.Has(raw.PCAN_ERROR_OK) {
+        t.Error("Has(OK) on OK error should be true")
+    }
+}
+
+func TestError_Has_Bit(t *testing.T) {
+    e := &Error{Code: raw.PCAN_ERROR_BUSOFF | raw.PCAN_ERROR_QOVERRUN}
+    if !e.Has(raw.PCAN_ERROR_BUSOFF) {
+        t.Error("expected BUSOFF bit set")
+    }
+    if !e.Has(raw.PCAN_ERROR_QOVERRUN) {
+        t.Error("expected QOVERRUN bit set")
+    }
+    if e.Has(raw.PCAN_ERROR_BUSPASSIVE) {
+        t.Error("expected BUSPASSIVE bit NOT set")
+    }
+}
+
+func TestError_Is_Bitmask(t *testing.T) {
+    e := &Error{Code: raw.PCAN_ERROR_BUSOFF | raw.PCAN_ERROR_QOVERRUN}
+    if !errors.Is(e, ErrBusOff) {
+        t.Error("expected errors.Is(e, ErrBusOff) to be true")
+    }
+    if !errors.Is(e, ErrQueueOverrun) {
+        t.Error("expected errors.Is(e, ErrQueueOverrun) to be true")
+    }
+    if errors.Is(e, ErrBusPassive) {
+        t.Error("expected errors.Is(e, ErrBusPassive) to be false")
+    }
+}
+
+func TestSendManyError_Unwrap(t *testing.T) {
+    inner := errors.New("boom")
+    e := &SendManyError{Index: 3, Err: inner}
+    if !errors.Is(e, inner) {
+        t.Error("expected SendManyError to unwrap to inner error")
+    }
+    if e.Error() == "" {
+        t.Error("expected non-empty Error()")
+    }
+}
+```
+
+- [ ] **Step：commit**
+
+```bash
+go test -run '^TestError|^TestSendMany' ./... -v
+git add errors.go errors_test.go
+git commit -m "feat: add error types with bitmask Is() and SendManyError"
+```
+
+### Task 2.3：status.go + status_test.go
+
+**Files:**
+- Create: `status.go`
+- Create: `status_test.go`
+
+```go
+// status.go
+package pcanbasic
+
+import "github.com/Crush251/pcanbasic_go/raw"
+
+// Status 是 PCAN 通道当前状态的位掩码值。
+// 直接 alias raw.TPCANStatus 以保证与官方常量值一致。
+type Status = raw.TPCANStatus
+
+const (
+    StatusOK           Status = raw.PCAN_ERROR_OK
+    StatusBusLight     Status = raw.PCAN_ERROR_BUSLIGHT
+    StatusBusHeavy     Status = raw.PCAN_ERROR_BUSHEAVY
+    StatusBusPassive   Status = raw.PCAN_ERROR_BUSPASSIVE
+    StatusBusOff       Status = raw.PCAN_ERROR_BUSOFF
+    StatusQueueOverrun Status = raw.PCAN_ERROR_QOVERRUN
+)
+
+// StatusHas 判断 status 中是否包含指定的位。
+// 特别处理 StatusOK (0)：仅当 status 也是 0 时才算"包含"。
+func StatusHas(status, bit Status) bool {
+    if bit == StatusOK {
+        return status == StatusOK
+    }
+    return status&bit == bit
+}
+```
+
+```go
+// status_test.go
+package pcanbasic
+
+import "testing"
+
+func TestStatus_OKBoundary(t *testing.T) {
+    if StatusHas(StatusBusOff, StatusOK) {
+        t.Error("Has(OK) on non-OK status should be false")
+    }
+    if !StatusHas(StatusOK, StatusOK) {
+        t.Error("Has(OK) on OK status should be true")
+    }
+}
+
+func TestStatus_BitMatching(t *testing.T) {
+    combined := StatusBusOff | StatusQueueOverrun
+    if !StatusHas(combined, StatusBusOff) {
+        t.Error("expected BUSOFF bit set")
+    }
+    if !StatusHas(combined, StatusQueueOverrun) {
+        t.Error("expected QOVERRUN bit set")
+    }
+    if StatusHas(combined, StatusBusPassive) {
+        t.Error("expected BUSPASSIVE bit NOT set")
+    }
+}
+```
+
+- [ ] **Step：commit**
+
+```bash
+go test -run '^TestStatus' ./... -v
+git add status.go status_test.go
+git commit -m "feat: add Status type aliasing raw.TPCANStatus"
+```
+
+### Task 2.4：frame.go + frame_test.go
+
+**Files:**
+- Create: `frame.go`
+- Create: `frame_test.go`
+
+```go
+// frame.go
+package pcanbasic
+
+import (
+    "time"
+)
+
+// Frame 代表一帧 CAN 报文，统一承载 Classical / Extended / Remote / FD。
+type Frame struct {
+    ID    uint32
+    Data  []byte
+    Flags FrameFlags
+
+    TimestampMicros uint64
+    ReceivedAt      time.Time
+}
+
+// FrameFlags 是 Frame 类型/属性位的组合。
+type FrameFlags uint16
+
+const (
+    FlagExtended FrameFlags = 1 << iota // 29 位扩展 ID
+    FlagRemote                          // 远程帧（仅 Classical）
+    FlagFD                              // FD 帧
+    FlagBRS                             // 加速段（FD 专用）
+    FlagESI                             // 错误状态指示（FD 专用）
+)
+
+// Has 判断 Flags 中是否包含指定位。
+func (f Frame) Has(flag FrameFlags) bool { return f.Flags&flag == flag }
+
+// 标准 CAN ID 范围。
+const (
+    maxStdID uint32 = 0x7FF
+    maxExtID uint32 = 0x1FFFFFFF
+)
+
+var fdValidLengths = map[int]bool{
+    0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true,
+    7: true, 8: true, 12: true, 16: true, 20: true, 24: true,
+    32: true, 48: true, 64: true,
+}
+
+// NewFrame 构造一帧标准 Classical CAN 报文。
+// ID 必须 ≤ 0x7FF，data 长度必须 ≤ 8。
+// data 会被深拷贝，调用者后续修改原切片不影响已构造的 Frame。
+func NewFrame(id uint32, data []byte) (Frame, error) {
+    if id > maxStdID {
+        return Frame{}, ErrIDOutOfRange
+    }
+    if len(data) > 8 {
+        return Frame{}, ErrDataTooLong
+    }
+    return Frame{
+        ID:   id,
+        Data: append([]byte(nil), data...),
+    }, nil
+}
+
+// NewExtendedFrame 构造一帧扩展 Classical CAN 报文。
+// ID 必须 ≤ 0x1FFFFFFF，data 长度必须 ≤ 8。
+func NewExtendedFrame(id uint32, data []byte) (Frame, error) {
+    if id > maxExtID {
+        return Frame{}, ErrIDOutOfRange
+    }
+    if len(data) > 8 {
+        return Frame{}, ErrDataTooLong
+    }
+    return Frame{
+        ID:    id,
+        Data:  append([]byte(nil), data...),
+        Flags: FlagExtended,
+    }, nil
+}
+
+// NewRemoteFrame 构造一帧远程请求帧（Classical CAN 专用）。
+// dlc 表示请求长度（≤ 8）；extended 控制是否使用 29 位扩展 ID。
+func NewRemoteFrame(id uint32, dlc uint8, extended bool) (Frame, error) {
+    if dlc > 8 {
+        return Frame{}, ErrDataTooLong
+    }
+    limit := maxStdID
+    flags := FlagRemote
+    if extended {
+        limit = maxExtID
+        flags |= FlagExtended
+    }
+    if id > limit {
+        return Frame{}, ErrIDOutOfRange
+    }
+    return Frame{
+        ID:    id,
+        Data:  make([]byte, dlc),
+        Flags: flags,
+    }, nil
+}
+
+// NewFDFrame 构造一帧 CAN FD 报文。
+// data 长度必须属于 {0..8, 12, 16, 20, 24, 32, 48, 64}。
+// brs 控制是否启用加速段；extended 控制是否使用 29 位扩展 ID。
+// FD 协议无 RTR，不允许 Remote。
+func NewFDFrame(id uint32, data []byte, brs, extended bool) (Frame, error) {
+    if !fdValidLengths[len(data)] {
+        return Frame{}, ErrInvalidFDLength
+    }
+    limit := maxStdID
+    flags := FlagFD
+    if extended {
+        limit = maxExtID
+        flags |= FlagExtended
+    }
+    if id > limit {
+        return Frame{}, ErrIDOutOfRange
+    }
+    if brs {
+        flags |= FlagBRS
+    }
+    return Frame{
+        ID:    id,
+        Data:  append([]byte(nil), data...),
+        Flags: flags,
+    }, nil
+}
+```
+
+```go
+// frame_test.go
+package pcanbasic
+
+import (
+    "errors"
+    "testing"
+)
+
+func TestNewFrame_OK(t *testing.T) {
+    f, err := NewFrame(0x123, []byte{1, 2, 3})
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if f.ID != 0x123 || len(f.Data) != 3 || f.Has(FlagExtended) {
+        t.Errorf("bad frame: %+v", f)
+    }
+}
+
+func TestNewFrame_IDOutOfRange(t *testing.T) {
+    _, err := NewFrame(0x800, nil)
+    if !errors.Is(err, ErrIDOutOfRange) {
+        t.Errorf("got %v, want ErrIDOutOfRange", err)
+    }
+}
+
+func TestNewFrame_DataTooLong(t *testing.T) {
+    _, err := NewFrame(0x1, make([]byte, 9))
+    if !errors.Is(err, ErrDataTooLong) {
+        t.Errorf("got %v, want ErrDataTooLong", err)
+    }
+}
+
+func TestNewFrame_DataIsCopied(t *testing.T) {
+    src := []byte{1, 2, 3}
+    f, _ := NewFrame(0x1, src)
+    src[0] = 0xFF
+    if f.Data[0] == 0xFF {
+        t.Error("Data was not deep-copied")
+    }
+}
+
+func TestNewExtendedFrame_OK(t *testing.T) {
+    f, err := NewExtendedFrame(0x1FFFFFFF, []byte{1, 2})
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if !f.Has(FlagExtended) {
+        t.Error("expected FlagExtended set")
+    }
+}
+
+func TestNewExtendedFrame_IDOutOfRange(t *testing.T) {
+    _, err := NewExtendedFrame(0x20000000, nil)
+    if !errors.Is(err, ErrIDOutOfRange) {
+        t.Errorf("got %v, want ErrIDOutOfRange", err)
+    }
+}
+
+func TestNewRemoteFrame_OK(t *testing.T) {
+    f, err := NewRemoteFrame(0x123, 4, false)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if !f.Has(FlagRemote) {
+        t.Error("expected FlagRemote set")
+    }
+    if len(f.Data) != 4 {
+        t.Errorf("len(Data) = %d, want 4", len(f.Data))
+    }
+}
+
+func TestNewRemoteFrame_DLCTooLarge(t *testing.T) {
+    _, err := NewRemoteFrame(0x123, 9, false)
+    if !errors.Is(err, ErrDataTooLong) {
+        t.Errorf("got %v, want ErrDataTooLong", err)
+    }
+}
+
+func TestNewFDFrame_ValidLengths(t *testing.T) {
+    for _, n := range []int{0, 1, 8, 12, 16, 32, 48, 64} {
+        _, err := NewFDFrame(0x1, make([]byte, n), false, false)
+        if err != nil {
+            t.Errorf("len=%d: unexpected error: %v", n, err)
+        }
+    }
+}
+
+func TestNewFDFrame_InvalidLengths(t *testing.T) {
+    for _, n := range []int{9, 10, 11, 13, 17, 25, 65} {
+        _, err := NewFDFrame(0x1, make([]byte, n), false, false)
+        if !errors.Is(err, ErrInvalidFDLength) {
+            t.Errorf("len=%d: got %v, want ErrInvalidFDLength", n, err)
+        }
+    }
+}
+
+func TestNewFDFrame_BRSFlag(t *testing.T) {
+    f, err := NewFDFrame(0x1, []byte{1}, true, false)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if !f.Has(FlagBRS) || !f.Has(FlagFD) {
+        t.Error("expected FlagBRS and FlagFD set")
+    }
+}
+```
+
+- [ ] **Step：commit**
+
+```bash
+go test -run '^TestNew' ./... -v
+git add frame.go frame_test.go
+git commit -m "feat: add Frame type with validating constructors"
+```
+
+### Task 2.5：logger.go
+
+**Files:**
+- Create: `logger.go`
+
+```go
+package pcanbasic
+
+// Logger 是本库内部使用的极简日志接口。
+//
+// 默认使用 noopLogger（什么都不打印）。如需接入 slog/zap/logrus，
+// 实现下面三个方法并通过 WithLogger 注入即可。
+type Logger interface {
+    Debugf(format string, args ...any)
+    Infof(format string, args ...any)
+    Warnf(format string, args ...any)
+}
+
+type noopLogger struct{}
+
+func (noopLogger) Debugf(string, ...any) {}
+func (noopLogger) Infof(string, ...any)  {}
+func (noopLogger) Warnf(string, ...any)  {}
+```
+
+- [ ] **Step：commit**
+
+```bash
+git add logger.go
+git commit -m "feat: add minimal Logger interface with noop default"
+```
+
+### Task 2.6：options.go + options_test.go
+
+**Files:**
+- Create: `options.go`
+- Create: `options_test.go`
+
+```go
+// options.go
+package pcanbasic
+
+import (
+    "time"
+
+    "github.com/Crush251/pcanbasic_go/raw"
+)
+
+// Channel 是 PCAN 通道句柄的别名，方便 Open 调用。
+type Channel = raw.TPCANHandle
+
+// Bitrate 是 Classical CAN 波特率的别名。
+type Bitrate = raw.TPCANBaudrate
+
+const (
+    USBBus1  Channel = raw.PCAN_USBBUS1
+    USBBus2  Channel = raw.PCAN_USBBUS2
+    USBBus3  Channel = raw.PCAN_USBBUS3
+    USBBus4  Channel = raw.PCAN_USBBUS4
+    USBBus5  Channel = raw.PCAN_USBBUS5
+    USBBus6  Channel = raw.PCAN_USBBUS6
+    USBBus7  Channel = raw.PCAN_USBBUS7
+    USBBus8  Channel = raw.PCAN_USBBUS8
+    USBBus9  Channel = raw.PCAN_USBBUS9
+    USBBus10 Channel = raw.PCAN_USBBUS10
+    USBBus11 Channel = raw.PCAN_USBBUS11
+    USBBus12 Channel = raw.PCAN_USBBUS12
+    USBBus13 Channel = raw.PCAN_USBBUS13
+    USBBus14 Channel = raw.PCAN_USBBUS14
+    USBBus15 Channel = raw.PCAN_USBBUS15
+    USBBus16 Channel = raw.PCAN_USBBUS16
+)
+
+const (
+    Baud1M   Bitrate = raw.PCAN_BAUD_1M
+    Baud500K Bitrate = raw.PCAN_BAUD_500K
+    Baud250K Bitrate = raw.PCAN_BAUD_250K
+    Baud125K Bitrate = raw.PCAN_BAUD_125K
+    Baud100K Bitrate = raw.PCAN_BAUD_100K
+    Baud50K  Bitrate = raw.PCAN_BAUD_50K
+    Baud20K  Bitrate = raw.PCAN_BAUD_20K
+    Baud10K  Bitrate = raw.PCAN_BAUD_10K
+    Baud5K   Bitrate = raw.PCAN_BAUD_5K
+)
+
+// ReceiveMode 控制 Bus 内部 reader goroutine 的等待策略。
+type ReceiveMode int
+
+const (
+    // ModeAuto：Windows + 驱动支持事件 → Event；否则退回 Polling。
+    ModeAuto ReceiveMode = iota
+    ModePolling
+    ModeEvent
+)
+
+// FilterMode 用于 SetFilter。
+type FilterMode uint8
+
+const (
+    FilterStandard FilterMode = 0 // 接收 11 位 ID
+    FilterExtended FilterMode = 1 // 接收 29 位 ID
+)
+
+// 默认参数值。
+const (
+    defaultBitrate       = Baud1M
+    defaultPollInterval  = time.Millisecond
+    defaultRxBufferSize  = 1024
+    defaultErrBufferSize = 16
+)
+
+type config struct {
+    bitrate      Bitrate
+    receiveMode  ReceiveMode
+    pollInterval time.Duration
+    rxBufferSize int
+    errBufferSize int
+    logger       Logger
+}
+
+func newDefaultConfig() *config {
+    return &config{
+        bitrate:       defaultBitrate,
+        receiveMode:   ModeAuto,
+        pollInterval:  defaultPollInterval,
+        rxBufferSize:  defaultRxBufferSize,
+        errBufferSize: defaultErrBufferSize,
+        logger:        noopLogger{},
+    }
+}
+
+// Option 用于配置 Open / OpenFD。
+type Option func(*config)
+
+// WithBitrate 设置 Classical CAN 波特率，默认 Baud1M。
+// OpenFD 时此选项被忽略（由 fdBitrate 字符串决定）。
+func WithBitrate(b Bitrate) Option { return func(c *config) { c.bitrate = b } }
+
+// WithReceiveMode 设置接收模式，默认 ModeAuto。
+func WithReceiveMode(m ReceiveMode) Option { return func(c *config) { c.receiveMode = m } }
+
+// WithPollInterval 设置 Polling 模式下的轮询间隔，默认 1ms。
+// 仅 ModePolling（或 ModeAuto 降级到 Polling）时生效。
+func WithPollInterval(d time.Duration) Option {
+    return func(c *config) {
+        if d > 0 {
+            c.pollInterval = d
+        }
+    }
+}
+
+// WithRxBufferSize 设置接收 channel 容量，默认 1024。
+func WithRxBufferSize(n int) Option {
+    return func(c *config) {
+        if n > 0 {
+            c.rxBufferSize = n
+        }
+    }
+}
+
+// WithErrBufferSize 设置错误 channel 容量，默认 16。
+func WithErrBufferSize(n int) Option {
+    return func(c *config) {
+        if n > 0 {
+            c.errBufferSize = n
+        }
+    }
+}
+
+// WithLogger 注入日志接口。默认 noopLogger 不打印任何东西。
+func WithLogger(l Logger) Option {
+    return func(c *config) {
+        if l != nil {
+            c.logger = l
+        }
+    }
+}
+```
+
+```go
+// options_test.go
+package pcanbasic
+
+import (
+    "testing"
+    "time"
+)
+
+func TestDefaultConfig(t *testing.T) {
+    c := newDefaultConfig()
+    if c.bitrate != Baud1M {
+        t.Errorf("bitrate = %v, want Baud1M", c.bitrate)
+    }
+    if c.receiveMode != ModeAuto {
+        t.Errorf("receiveMode = %v, want ModeAuto", c.receiveMode)
+    }
+    if c.pollInterval != time.Millisecond {
+        t.Errorf("pollInterval = %v, want 1ms", c.pollInterval)
+    }
+    if c.rxBufferSize != 1024 {
+        t.Errorf("rxBufferSize = %d, want 1024", c.rxBufferSize)
+    }
+    if c.errBufferSize != 16 {
+        t.Errorf("errBufferSize = %d, want 16", c.errBufferSize)
+    }
+    if c.logger == nil {
+        t.Error("logger should default to noopLogger")
+    }
+}
+
+func TestOption_Apply(t *testing.T) {
+    c := newDefaultConfig()
+    WithBitrate(Baud500K)(c)
+    WithReceiveMode(ModeEvent)(c)
+    WithPollInterval(5 * time.Millisecond)(c)
+    WithRxBufferSize(4096)(c)
+    WithErrBufferSize(64)(c)
+
+    if c.bitrate != Baud500K {
+        t.Error("bitrate not applied")
+    }
+    if c.receiveMode != ModeEvent {
+        t.Error("receiveMode not applied")
+    }
+    if c.pollInterval != 5*time.Millisecond {
+        t.Error("pollInterval not applied")
+    }
+    if c.rxBufferSize != 4096 {
+        t.Error("rxBufferSize not applied")
+    }
+    if c.errBufferSize != 64 {
+        t.Error("errBufferSize not applied")
+    }
+}
+
+func TestOption_RejectsNonPositive(t *testing.T) {
+    c := newDefaultConfig()
+    WithPollInterval(0)(c)
+    WithRxBufferSize(0)(c)
+    WithErrBufferSize(-1)(c)
+    WithLogger(nil)(c)
+
+    if c.pollInterval != time.Millisecond {
+        t.Error("pollInterval should ignore non-positive")
+    }
+    if c.rxBufferSize != 1024 {
+        t.Error("rxBufferSize should ignore non-positive")
+    }
+    if c.errBufferSize != 16 {
+        t.Error("errBufferSize should ignore non-positive")
+    }
+    if c.logger == nil {
+        t.Error("logger should ignore nil")
+    }
+}
+```
+
+- [ ] **Step：commit**
+
+```bash
+go test -run '^TestDefaultConfig|^TestOption' ./... -v
+git add options.go options_test.go
+git commit -m "feat: add Option pattern with channel/bitrate/mode aliases"
+```
+
+### 阶段 2 出口条件
+
+- `go test ./... -race` 通过（不含 Bus 测试）
+- `go vet ./...` 通过
+- 覆盖率 `go test -cover .` 显示 frame/errors/status/options 覆盖率 ≥ 80%
+
+---
+
+## 阶段 3：rawAdapter + Bus 骨架（无 reader）
+
+**目标**：把 Open/Close/Send/SendMany/Status/Reset 这些与 reader 无关的同步 API 跑通。
+reader 在阶段 4 才加。
+
+### Task 3.1：adapter.go
+
+**Files:**
+- Create: `adapter.go`
+
+```go
+package pcanbasic
+
+import "github.com/Crush251/pcanbasic_go/raw"
+
+// rawAdapter 是 Bus 用到的底层调用的接口抽象，便于测试注入 fake。
+// 不导出 → 不是稳定 API。
+type rawAdapter interface {
+    Initialize(ch raw.TPCANHandle, br raw.TPCANBaudrate) raw.TPCANStatus
+    InitializeFD(ch raw.TPCANHandle, bitrateFD string) raw.TPCANStatus
+    Uninitialize(ch raw.TPCANHandle) raw.TPCANStatus
+
+    Read(ch raw.TPCANHandle, m *raw.TPCANMsg, t *raw.TPCANTimestamp) raw.TPCANStatus
+    ReadFD(ch raw.TPCANHandle, m *raw.TPCANMsgFD, t *raw.TPCANTimestampFD) raw.TPCANStatus
+    Write(ch raw.TPCANHandle, m *raw.TPCANMsg) raw.TPCANStatus
+    WriteFD(ch raw.TPCANHandle, m *raw.TPCANMsgFD) raw.TPCANStatus
+
+    GetStatus(ch raw.TPCANHandle) raw.TPCANStatus
+    GetErrorText(code raw.TPCANStatus, lang uint16) (string, raw.TPCANStatus)
+    Reset(ch raw.TPCANHandle) raw.TPCANStatus
+}
+
+// liveAdapter 是生产实现：薄包装直接调 raw.*。
+type liveAdapter struct{}
+
+func (liveAdapter) Initialize(ch raw.TPCANHandle, br raw.TPCANBaudrate) raw.TPCANStatus {
+    return raw.Initialize(ch, br)
+}
+func (liveAdapter) InitializeFD(ch raw.TPCANHandle, b string) raw.TPCANStatus {
+    return raw.InitializeFD(ch, b)
+}
+func (liveAdapter) Uninitialize(ch raw.TPCANHandle) raw.TPCANStatus {
+    return raw.Uninitialize(ch)
+}
+func (liveAdapter) Read(ch raw.TPCANHandle, m *raw.TPCANMsg, t *raw.TPCANTimestamp) raw.TPCANStatus {
+    return raw.Read(ch, m, t)
+}
+func (liveAdapter) ReadFD(ch raw.TPCANHandle, m *raw.TPCANMsgFD, t *raw.TPCANTimestampFD) raw.TPCANStatus {
+    return raw.ReadFD(ch, m, t)
+}
+func (liveAdapter) Write(ch raw.TPCANHandle, m *raw.TPCANMsg) raw.TPCANStatus {
+    return raw.Write(ch, m)
+}
+func (liveAdapter) WriteFD(ch raw.TPCANHandle, m *raw.TPCANMsgFD) raw.TPCANStatus {
+    return raw.WriteFD(ch, m)
+}
+func (liveAdapter) GetStatus(ch raw.TPCANHandle) raw.TPCANStatus {
+    return raw.GetStatus(ch)
+}
+func (liveAdapter) GetErrorText(code raw.TPCANStatus, lang uint16) (string, raw.TPCANStatus) {
+    return raw.GetErrorText(code, lang)
+}
+func (liveAdapter) Reset(ch raw.TPCANHandle) raw.TPCANStatus {
+    return raw.Reset(ch)
+}
+```
+
+- [ ] **Step：commit**
+
+```bash
+git add adapter.go
+git commit -m "feat: add rawAdapter interface with live implementation"
+```
+
+### Task 3.2：bus.go（仅同步部分） + pcanbasic.go（Open/OpenFD）
+
+**Files:**
+- Create: `bus.go`
+- Create: `pcanbasic.go`
+- Create: `doc.go`
+
+`doc.go`：
+
+```go
+// Package pcanbasic 是 PEAK-System PCANBasic.dll 的 Go 封装库（Windows 专用）。
+//
+// 顶层包提供 idiomatic Go 高层 API（Bus / Frame / Option / Error），
+// 大多数应用直接使用本包即可。需要 PCAN 特殊功能或希望进一步定制时，
+// 可使用子包 github.com/Crush251/pcanbasic_go/raw。
+//
+// # 快速开始
+//
+//  bus, err := pcanbasic.Open(pcanbasic.USBBus1, pcanbasic.WithBitrate(pcanbasic.Baud1M))
+//  if err != nil { log.Fatal(err) }
+//  defer bus.Close()
+//
+//  f, _ := pcanbasic.NewFrame(0x123, []byte{1, 2, 3})
+//  _ = bus.Send(context.Background(), f)
+//
+// 详见 README 与 docs/quickstart.md。
+package pcanbasic
+```
+
+`bus.go`（先实现 Open 后的同步接口；reader 在阶段 4 补充）：
+
+```go
+package pcanbasic
+
+import (
+    "context"
+    "sync"
+    "sync/atomic"
+
+    "github.com/Crush251/pcanbasic_go/raw"
+)
+
+// Bus 表示一个已初始化的 CAN/CAN FD 通道。
+//
+// 必须使用 Close 释放资源。Close 幂等。
+type Bus struct {
+    ch    raw.TPCANHandle
+    adapt rawAdapter
+    cfg   *config
+    isFD  bool
+
+    // 接收侧（阶段 4 引入）
+    rxCh    chan Frame
+    errCh   chan error
+    closing chan struct{}
+
+    // 关闭管理
+    closeOnce sync.Once
+    closed    atomic.Bool
+}
+
+// Open 打开一个 Classical CAN 通道。
+func Open(ch Channel, opts ...Option) (*Bus, error) {
+    return openWith(liveAdapter{}, ch, false, "", opts...)
+}
+
+// OpenFD 打开一个 CAN FD 通道。
+// fdBitrate 是 PCAN 官方格式的字符串，详见 docs/can-fd.md。
+func OpenFD(ch Channel, fdBitrate string, opts ...Option) (*Bus, error) {
+    return openWith(liveAdapter{}, ch, true, fdBitrate, opts...)
+}
+
+func openWith(adapt rawAdapter, ch Channel, fd bool, fdBitrate string, opts ...Option) (*Bus, error) {
+    cfg := newDefaultConfig()
+    for _, opt := range opts {
+        opt(cfg)
+    }
+
+    var status raw.TPCANStatus
+    if fd {
+        status = adapt.InitializeFD(ch, fdBitrate)
+    } else {
+        status = adapt.Initialize(ch, cfg.bitrate)
+    }
+    if status != raw.PCAN_ERROR_OK {
+        return nil, wrapStatus(adapt, "CAN_Initialize", status)
+    }
+
+    b := &Bus{
+        ch:      ch,
+        adapt:   adapt,
+        cfg:     cfg,
+        isFD:    fd,
+        rxCh:    make(chan Frame, cfg.rxBufferSize),
+        errCh:   make(chan error, cfg.errBufferSize),
+        closing: make(chan struct{}),
+    }
+    // reader goroutine 在阶段 4 启动
+    return b, nil
+}
+
+// Send 同步发送一帧。Close 后调用返回 ErrBusClosed。
+func (b *Bus) Send(ctx context.Context, f Frame) error {
+    if b.closed.Load() {
+        return ErrBusClosed
+    }
+    if err := ctx.Err(); err != nil {
+        return err
+    }
+    if !b.isFD && f.Has(FlagFD) {
+        // 非 FD Bus 不允许发 FD 帧
+        return ErrFDNotSupportedOnBus
+    }
+
+    if f.Has(FlagFD) {
+        m := toRawMsgFD(f)
+        if s := b.adapt.WriteFD(b.ch, &m); s != raw.PCAN_ERROR_OK {
+            return wrapStatus(b.adapt, "CAN_WriteFD", s)
+        }
+        return nil
+    }
+    m := toRawMsg(f)
+    if s := b.adapt.Write(b.ch, &m); s != raw.PCAN_ERROR_OK {
+        return wrapStatus(b.adapt, "CAN_Write", s)
+    }
+    return nil
+}
+
+// SendMany 顺序逐帧发送，任意一帧失败立即返回 *SendManyError。
+// 已成功发送的帧不会回滚（CAN 总线无事务概念）。
+func (b *Bus) SendMany(ctx context.Context, frames []Frame) error {
+    for i, f := range frames {
+        if err := ctx.Err(); err != nil {
+            return &SendManyError{Index: i, Frame: copyFrame(f), Err: err}
+        }
+        if err := b.Send(ctx, f); err != nil {
+            return &SendManyError{Index: i, Frame: copyFrame(f), Err: err}
+        }
+    }
+    return nil
+}
+
+// Status 查询通道当前状态。
+func (b *Bus) Status() (Status, error) {
+    if b.closed.Load() {
+        return 0, ErrBusClosed
+    }
+    s := b.adapt.GetStatus(b.ch)
+    // GetStatus 返回的值就是 status 本身（OK / BUSLIGHT / ... 的位组合）。
+    return Status(s), nil
+}
+
+// Reset 复位通道（清空 PCAN 内部收发队列）。
+func (b *Bus) Reset() error {
+    if b.closed.Load() {
+        return ErrBusClosed
+    }
+    if s := b.adapt.Reset(b.ch); s != raw.PCAN_ERROR_OK {
+        return wrapStatus(b.adapt, "CAN_Reset", s)
+    }
+    return nil
+}
+
+// Close 释放底层通道。幂等：多次调用安全。
+func (b *Bus) Close() error {
+    var err error
+    b.closeOnce.Do(func() {
+        b.closed.Store(true)
+        close(b.closing)
+        // reader goroutine 关闭 rxCh（阶段 4 接入）；这里暂时直接关，待阶段 4 调整
+        // 为：等 reader 退出 → Uninitialize → close errCh
+        close(b.rxCh)
+        if s := b.adapt.Uninitialize(b.ch); s != raw.PCAN_ERROR_OK {
+            err = wrapStatus(b.adapt, "CAN_Uninitialize", s)
+        }
+        close(b.errCh)
+    })
+    return err
+}
+
+// Receive 返回流式接收 channel。Bus 关闭时 channel 也关闭。
+func (b *Bus) Receive() <-chan Frame { return b.rxCh }
+
+// Errors 返回接收侧的异步错误流。Bus 关闭时 channel 也关闭。
+// QRCVEMPTY 不会出现在这里。
+func (b *Bus) Errors() <-chan error { return b.errCh }
+
+// wrapStatus 把 raw 状态码包成 *Error，附带 GetErrorText 取到的描述。
+func wrapStatus(adapt rawAdapter, op string, code raw.TPCANStatus) *Error {
+    msg, _ := adapt.GetErrorText(code, raw.LanguageEnglish)
+    return &Error{Code: code, Op: op, Msg: msg}
+}
+
+// copyFrame 深拷贝 Frame.Data 用于 SendManyError 持久持有。
+func copyFrame(f Frame) Frame {
+    out := f
+    if f.Data != nil {
+        out.Data = append([]byte(nil), f.Data...)
+    }
+    return out
+}
+
+// toRawMsg / toRawMsgFD 把 Frame 转成底层结构。
+func toRawMsg(f Frame) raw.TPCANMsg {
+    var mt raw.TPCANMessageType
+    if f.Has(FlagExtended) {
+        mt |= raw.PCAN_MESSAGE_EXTENDED
+    }
+    if f.Has(FlagRemote) {
+        mt |= raw.PCAN_MESSAGE_RTR
+    }
+    m := raw.TPCANMsg{
+        ID:      f.ID,
+        MsgType: mt,
+        Len:     uint8(len(f.Data)),
+    }
+    copy(m.Data[:], f.Data)
+    return m
+}
+
+func toRawMsgFD(f Frame) raw.TPCANMsgFD {
+    var mt raw.TPCANMessageType
+    mt |= raw.PCAN_MESSAGE_FD
+    if f.Has(FlagExtended) {
+        mt |= raw.PCAN_MESSAGE_EXTENDED
+    }
+    if f.Has(FlagBRS) {
+        mt |= raw.PCAN_MESSAGE_BRS
+    }
+    if f.Has(FlagESI) {
+        mt |= raw.PCAN_MESSAGE_ESI
+    }
+    m := raw.TPCANMsgFD{
+        ID:      f.ID,
+        MsgType: mt,
+        DLC:     dataLenToDLC(len(f.Data)),
+    }
+    copy(m.Data[:], f.Data)
+    return m
+}
+
+func dataLenToDLC(n int) uint8 {
+    switch n {
+    case 0, 1, 2, 3, 4, 5, 6, 7, 8:
+        return uint8(n)
+    case 12:
+        return 9
+    case 16:
+        return 10
+    case 20:
+        return 11
+    case 24:
+        return 12
+    case 32:
+        return 13
+    case 48:
+        return 14
+    case 64:
+        return 15
+    }
+    return 0
+}
+
+func dlcToDataLen(d uint8) int {
+    switch d {
+    case 9:
+        return 12
+    case 10:
+        return 16
+    case 11:
+        return 20
+    case 12:
+        return 24
+    case 13:
+        return 32
+    case 14:
+        return 48
+    case 15:
+        return 64
+    default:
+        if d <= 8 {
+            return int(d)
+        }
+        return 0
+    }
+}
+```
+
+`pcanbasic.go`（轻量入口，目前 doc.go 已起到包级注释作用，pcanbasic.go 可只占位声明 Open/OpenFD 已在 bus.go 实现 — 故 **不再创建 pcanbasic.go**，更新计划文件清单）。
+
+> ⚠️ 修订：删除原计划 `pcanbasic.go` —— Open/OpenFD 直接放 `bus.go` 顶部，doc 在 `doc.go`。文件少一个，更内聚。
+
+### Task 3.3：adapter_fake_test.go（测试 fake）
+
+**Files:**
+- Create: `adapter_fake_test.go`
+
+```go
+package pcanbasic
+
+import (
+    "sync"
+
+    "github.com/Crush251/pcanbasic_go/raw"
+)
+
+// fakeAdapter 是测试用 rawAdapter 实现：可编程返回状态、记录调用、注入收到的帧。
+type fakeAdapter struct {
+    mu sync.Mutex
+
+    // 计数
+    initializeCalls   int
+    initializeFDCalls int
+    uninitializeCalls int
+    writeCalls        int
+    writeFDCalls      int
+    resetCalls        int
+    readCalls         int
+    readFDCalls       int
+
+    // 行为控制
+    initializeReturn   raw.TPCANStatus
+    initializeFDReturn raw.TPCANStatus
+    uninitializeReturn raw.TPCANStatus
+    writeReturn        raw.TPCANStatus
+    writeFDReturn      raw.TPCANStatus
+    resetReturn        raw.TPCANStatus
+    statusReturn       raw.TPCANStatus
+    errorTextReturn    string
+
+    // 自定义 Write 行为：按调用次数返回不同状态（用于 SendMany 测试）
+    writeSequence   []raw.TPCANStatus
+    writeFDSequence []raw.TPCANStatus
+
+    // 收到的最后一帧（便于断言）
+    lastWrittenMsg   *raw.TPCANMsg
+    lastWrittenMsgFD *raw.TPCANMsgFD
+
+    // 待派发的接收帧（reader 模式下从这里取）
+    rxQueue   []rxItem
+    rxFDQueue []rxFDItem
+}
+
+type rxItem struct {
+    msg raw.TPCANMsg
+    ts  raw.TPCANTimestamp
+}
+type rxFDItem struct {
+    msg raw.TPCANMsgFD
+    ts  raw.TPCANTimestampFD
+}
+
+func newFakeAdapter() *fakeAdapter {
+    return &fakeAdapter{
+        initializeReturn:   raw.PCAN_ERROR_OK,
+        initializeFDReturn: raw.PCAN_ERROR_OK,
+        uninitializeReturn: raw.PCAN_ERROR_OK,
+        writeReturn:        raw.PCAN_ERROR_OK,
+        writeFDReturn:      raw.PCAN_ERROR_OK,
+        resetReturn:        raw.PCAN_ERROR_OK,
+        statusReturn:       raw.PCAN_ERROR_OK,
+        errorTextReturn:    "fake error text",
+    }
+}
+
+func (f *fakeAdapter) Initialize(ch raw.TPCANHandle, br raw.TPCANBaudrate) raw.TPCANStatus {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.initializeCalls++
+    return f.initializeReturn
+}
+
+func (f *fakeAdapter) InitializeFD(ch raw.TPCANHandle, b string) raw.TPCANStatus {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.initializeFDCalls++
+    return f.initializeFDReturn
+}
+
+func (f *fakeAdapter) Uninitialize(ch raw.TPCANHandle) raw.TPCANStatus {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.uninitializeCalls++
+    return f.uninitializeReturn
+}
+
+func (f *fakeAdapter) Read(ch raw.TPCANHandle, m *raw.TPCANMsg, t *raw.TPCANTimestamp) raw.TPCANStatus {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.readCalls++
+    if len(f.rxQueue) == 0 {
+        return raw.PCAN_ERROR_QRCVEMPTY
+    }
+    item := f.rxQueue[0]
+    f.rxQueue = f.rxQueue[1:]
+    *m = item.msg
+    *t = item.ts
+    return raw.PCAN_ERROR_OK
+}
+
+func (f *fakeAdapter) ReadFD(ch raw.TPCANHandle, m *raw.TPCANMsgFD, t *raw.TPCANTimestampFD) raw.TPCANStatus {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.readFDCalls++
+    if len(f.rxFDQueue) == 0 {
+        return raw.PCAN_ERROR_QRCVEMPTY
+    }
+    item := f.rxFDQueue[0]
+    f.rxFDQueue = f.rxFDQueue[1:]
+    *m = item.msg
+    *t = item.ts
+    return raw.PCAN_ERROR_OK
+}
+
+func (f *fakeAdapter) Write(ch raw.TPCANHandle, m *raw.TPCANMsg) raw.TPCANStatus {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.writeCalls++
+    cp := *m
+    f.lastWrittenMsg = &cp
+    if len(f.writeSequence) > 0 {
+        s := f.writeSequence[0]
+        f.writeSequence = f.writeSequence[1:]
+        return s
+    }
+    return f.writeReturn
+}
+
+func (f *fakeAdapter) WriteFD(ch raw.TPCANHandle, m *raw.TPCANMsgFD) raw.TPCANStatus {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.writeFDCalls++
+    cp := *m
+    f.lastWrittenMsgFD = &cp
+    if len(f.writeFDSequence) > 0 {
+        s := f.writeFDSequence[0]
+        f.writeFDSequence = f.writeFDSequence[1:]
+        return s
+    }
+    return f.writeFDReturn
+}
+
+func (f *fakeAdapter) GetStatus(ch raw.TPCANHandle) raw.TPCANStatus {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    return f.statusReturn
+}
+
+func (f *fakeAdapter) GetErrorText(code raw.TPCANStatus, lang uint16) (string, raw.TPCANStatus) {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    return f.errorTextReturn, raw.PCAN_ERROR_OK
+}
+
+func (f *fakeAdapter) Reset(ch raw.TPCANHandle) raw.TPCANStatus {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.resetCalls++
+    return f.resetReturn
+}
+
+func (f *fakeAdapter) push(msg raw.TPCANMsg) {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.rxQueue = append(f.rxQueue, rxItem{msg: msg})
+}
+
+func (f *fakeAdapter) pushFD(msg raw.TPCANMsgFD) {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.rxFDQueue = append(f.rxFDQueue, rxFDItem{msg: msg})
+}
+```
+
+### Task 3.4：bus_test.go（同步部分，无 reader）
+
+**Files:**
+- Create: `bus_test.go`
+
+阶段 3 涵盖以下测试，剩余 reader 测试在阶段 4 添加：
+
+```go
+package pcanbasic
+
+import (
+    "context"
+    "errors"
+    "testing"
+
+    "github.com/Crush251/pcanbasic_go/raw"
+)
+
+// openTest 是测试专用入口，注入 fake adapter。
+func openTest(t *testing.T, adapt rawAdapter, opts ...Option) *Bus {
+    t.Helper()
+    bus, err := openWith(adapt, USBBus1, false, "", opts...)
+    if err != nil {
+        t.Fatalf("openWith: %v", err)
+    }
+    return bus
+}
+
+func openTestFD(t *testing.T, adapt rawAdapter, opts ...Option) *Bus {
+    t.Helper()
+    bus, err := openWith(adapt, USBBus1, true, "f_clock=80000000", opts...)
+    if err != nil {
+        t.Fatalf("openWith FD: %v", err)
+    }
+    return bus
+}
+
+func TestOpen_InitFailureMaps(t *testing.T) {
+    f := newFakeAdapter()
+    f.initializeReturn = raw.PCAN_ERROR_INITIALIZE
+    _, err := openWith(f, USBBus1, false, "")
+    if err == nil {
+        t.Fatal("expected error")
+    }
+    if !errors.Is(err, ErrNotInitialized) {
+        t.Errorf("expected ErrNotInitialized, got %v", err)
+    }
+}
+
+func TestSend_OK(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    defer bus.Close()
+
+    frame, _ := NewFrame(0x123, []byte{1, 2, 3})
+    if err := bus.Send(context.Background(), frame); err != nil {
+        t.Fatal(err)
+    }
+    if f.writeCalls != 1 {
+        t.Errorf("writeCalls = %d, want 1", f.writeCalls)
+    }
+    if f.lastWrittenMsg.ID != 0x123 || f.lastWrittenMsg.Len != 3 {
+        t.Errorf("bad msg: %+v", f.lastWrittenMsg)
+    }
+}
+
+func TestSend_AfterClose(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    bus.Close()
+    frame, _ := NewFrame(0x1, nil)
+    err := bus.Send(context.Background(), frame)
+    if !errors.Is(err, ErrBusClosed) {
+        t.Errorf("got %v, want ErrBusClosed", err)
+    }
+}
+
+func TestClose_Idempotent(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    if err := bus.Close(); err != nil {
+        t.Fatal(err)
+    }
+    if err := bus.Close(); err != nil {
+        t.Fatalf("second Close should not error: %v", err)
+    }
+    if f.uninitializeCalls != 1 {
+        t.Errorf("uninitializeCalls = %d, want 1", f.uninitializeCalls)
+    }
+}
+
+func TestSend_FDFrameOnClassicalBus(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    defer bus.Close()
+
+    frame, _ := NewFDFrame(0x1, []byte{1, 2}, false, false)
+    err := bus.Send(context.Background(), frame)
+    if !errors.Is(err, ErrFDNotSupportedOnBus) {
+        t.Errorf("got %v, want ErrFDNotSupportedOnBus", err)
+    }
+}
+
+func TestSend_ClassicalFrameOnFDBus(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTestFD(t, f)
+    defer bus.Close()
+
+    frame, _ := NewFrame(0x1, []byte{1, 2})
+    if err := bus.Send(context.Background(), frame); err != nil {
+        t.Fatalf("Classical frame on FD bus should be allowed: %v", err)
+    }
+    if f.writeCalls != 1 {
+        t.Errorf("expected Write to be used for Classical frame on FD bus, got writeCalls=%d", f.writeCalls)
+    }
+}
+
+func TestSend_FDFrameOnFDBus(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTestFD(t, f)
+    defer bus.Close()
+
+    frame, _ := NewFDFrame(0x1, []byte{1, 2}, true, false)
+    if err := bus.Send(context.Background(), frame); err != nil {
+        t.Fatal(err)
+    }
+    if f.writeFDCalls != 1 {
+        t.Errorf("writeFDCalls = %d, want 1", f.writeFDCalls)
+    }
+    if f.lastWrittenMsgFD.MsgType&raw.PCAN_MESSAGE_BRS == 0 {
+        t.Error("expected BRS bit set on FD msg")
+    }
+}
+
+func TestSendMany_AllOK(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    defer bus.Close()
+
+    frames := []Frame{}
+    for i := 0; i < 5; i++ {
+        fr, _ := NewFrame(uint32(0x100+i), []byte{byte(i)})
+        frames = append(frames, fr)
+    }
+    if err := bus.SendMany(context.Background(), frames); err != nil {
+        t.Fatal(err)
+    }
+    if f.writeCalls != 5 {
+        t.Errorf("writeCalls = %d, want 5", f.writeCalls)
+    }
+}
+
+func TestSendMany_PartialFailure(t *testing.T) {
+    f := newFakeAdapter()
+    f.writeSequence = []raw.TPCANStatus{
+        raw.PCAN_ERROR_OK,
+        raw.PCAN_ERROR_OK,
+        raw.PCAN_ERROR_QXMTFULL,
+    }
+    bus := openTest(t, f)
+    defer bus.Close()
+
+    frames := []Frame{}
+    for i := 0; i < 5; i++ {
+        fr, _ := NewFrame(uint32(0x100+i), []byte{byte(i)})
+        frames = append(frames, fr)
+    }
+    err := bus.SendMany(context.Background(), frames)
+    if err == nil {
+        t.Fatal("expected error")
+    }
+    var sme *SendManyError
+    if !errors.As(err, &sme) {
+        t.Fatalf("expected *SendManyError, got %T", err)
+    }
+    if sme.Index != 2 {
+        t.Errorf("Index = %d, want 2", sme.Index)
+    }
+}
+
+func TestSendMany_CtxCancel(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    defer bus.Close()
+
+    ctx, cancel := context.WithCancel(context.Background())
+    cancel()
+
+    frames := []Frame{}
+    for i := 0; i < 5; i++ {
+        fr, _ := NewFrame(uint32(0x100+i), nil)
+        frames = append(frames, fr)
+    }
+    err := bus.SendMany(ctx, frames)
+    var sme *SendManyError
+    if !errors.As(err, &sme) {
+        t.Fatalf("expected *SendManyError, got %v", err)
+    }
+    if sme.Index != 0 {
+        t.Errorf("Index = %d, want 0", sme.Index)
+    }
+    if !errors.Is(sme.Err, context.Canceled) {
+        t.Errorf("Err = %v, want context.Canceled", sme.Err)
+    }
+}
+
+func TestStatus_OK(t *testing.T) {
+    f := newFakeAdapter()
+    f.statusReturn = raw.PCAN_ERROR_OK
+    bus := openTest(t, f)
+    defer bus.Close()
+    s, err := bus.Status()
+    if err != nil {
+        t.Fatal(err)
+    }
+    if s != StatusOK {
+        t.Errorf("status = 0x%X, want OK", uint32(s))
+    }
+}
+
+func TestReset_OK(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    defer bus.Close()
+    if err := bus.Reset(); err != nil {
+        t.Fatal(err)
+    }
+    if f.resetCalls != 1 {
+        t.Errorf("resetCalls = %d, want 1", f.resetCalls)
+    }
+}
+```
+
+- [ ] **Step：跑 + commit**
+
+```bash
+go test -race ./... -v
+git add adapter.go bus.go doc.go adapter_fake_test.go bus_test.go
+git commit -m "feat: add Bus skeleton with sync Send/SendMany/Status/Reset/Close"
+```
+
+### 阶段 3 出口条件
+
+- 全部测试 `-race` 通过
+- `go vet ./...` 通过
+- 已实现：Open / OpenFD / Send / SendMany / Status / Reset / Close（幂等）
+- 未实现：reader goroutine（Receive/ReadOne/TryRead 返回 zero/关闭，测试在阶段 4 加）
+
+---
+
+## 阶段 4：reader goroutine + 三种接收模式
+
+**目标**：实现 Polling / Event / Auto 三模式；完成 Receive / ReadOne / TryRead；
+完善 Close 流程（等 reader 退出再 Uninitialize）。
+
+### Task 4.1：reader.go（拆分 Bus 的 reader 逻辑）
+
+**Files:**
+- Create: `reader.go`
+- Modify: `bus.go`（更新 Open/Close 流程）
+- Modify: `adapter.go`（如 Event 模式需要 SetValue，按需在阶段 5 补；本阶段 Event
+  实现仅 Windows 真实，Linux fake 走 Polling 路径）
+
+`reader.go`：
+
+```go
+package pcanbasic
+
+import (
+    "errors"
+    "time"
+
+    "github.com/Crush251/pcanbasic_go/raw"
+)
+
+// errQueueEmpty 是内部信号：底层报告"队列空"。
+// 仅 reader 内部使用，不会暴露给 Errors() channel。
+var errQueueEmpty = errors.New("internal: queue empty")
+
+func (b *Bus) startReader() {
+    go b.readerLoop()
+}
+
+func (b *Bus) readerLoop() {
+    defer close(b.rxCh)
+    for {
+        if !b.waitForData() {
+            return
+        }
+        for {
+            f, err := b.readOnce()
+            if errors.Is(err, errQueueEmpty) {
+                break
+            }
+            if err != nil {
+                select {
+                case b.errCh <- err:
+                default: // errCh 满则丢弃
+                }
+                break
+            }
+            select {
+            case b.rxCh <- f:
+            case <-b.closing:
+                return
+            }
+        }
+    }
+}
+
+// waitForData 根据接收模式等待"有数据"信号。
+// 返回 false 表示要退出（closing 已关闭）。
+func (b *Bus) waitForData() bool {
+    select {
+    case <-b.closing:
+        return false
+    default:
+    }
+
+    // 阶段 4 仅实现 Polling；Event 在阶段 5 接入。
+    timer := time.NewTimer(b.cfg.pollInterval)
+    defer timer.Stop()
+    select {
+    case <-timer.C:
+        return true
+    case <-b.closing:
+        return false
+    }
+}
+
+// readOnce 从底层读一帧。队列空返回 errQueueEmpty。
+func (b *Bus) readOnce() (Frame, error) {
+    if b.isFD {
+        return b.readOnceFD()
+    }
+    return b.readOnceClassical()
+}
+
+func (b *Bus) readOnceClassical() (Frame, error) {
+    var (
+        m  raw.TPCANMsg
+        ts raw.TPCANTimestamp
+    )
+    s := b.adapt.Read(b.ch, &m, &ts)
+    if s == raw.PCAN_ERROR_QRCVEMPTY {
+        return Frame{}, errQueueEmpty
+    }
+    if s != raw.PCAN_ERROR_OK {
+        return Frame{}, wrapStatus(b.adapt, "CAN_Read", s)
+    }
+    return Frame{
+        ID:    m.ID,
+        Data:  append([]byte(nil), m.Data[:m.Len]...),
+        Flags: msgTypeToFlags(m.MsgType),
+        TimestampMicros: uint64(ts.Millis)*1000 +
+            uint64(ts.MillisOverflow)*0xFFFFFFFF*1000 +
+            uint64(ts.Micros),
+        ReceivedAt: time.Now(),
+    }, nil
+}
+
+func (b *Bus) readOnceFD() (Frame, error) {
+    var (
+        m  raw.TPCANMsgFD
+        ts raw.TPCANTimestampFD
+    )
+    s := b.adapt.ReadFD(b.ch, &m, &ts)
+    if s == raw.PCAN_ERROR_QRCVEMPTY {
+        return Frame{}, errQueueEmpty
+    }
+    if s != raw.PCAN_ERROR_OK {
+        return Frame{}, wrapStatus(b.adapt, "CAN_ReadFD", s)
+    }
+    n := dlcToDataLen(m.DLC)
+    return Frame{
+        ID:              m.ID,
+        Data:            append([]byte(nil), m.Data[:n]...),
+        Flags:           msgTypeToFlags(m.MsgType),
+        TimestampMicros: uint64(ts),
+        ReceivedAt:      time.Now(),
+    }, nil
+}
+
+func msgTypeToFlags(mt raw.TPCANMessageType) FrameFlags {
+    var f FrameFlags
+    if mt&raw.PCAN_MESSAGE_EXTENDED != 0 {
+        f |= FlagExtended
+    }
+    if mt&raw.PCAN_MESSAGE_RTR != 0 {
+        f |= FlagRemote
+    }
+    if mt&raw.PCAN_MESSAGE_FD != 0 {
+        f |= FlagFD
+    }
+    if mt&raw.PCAN_MESSAGE_BRS != 0 {
+        f |= FlagBRS
+    }
+    if mt&raw.PCAN_MESSAGE_ESI != 0 {
+        f |= FlagESI
+    }
+    return f
+}
+```
+
+`bus.go` 修改：
+
+- `openWith` 末尾调 `b.startReader()`
+- `Close()` 流程改为：set closed → close(closing) → 等待 rxCh 关（reader 退出） →
+  Uninitialize → close(errCh)。改后：
+
+```go
+func (b *Bus) Close() error {
+    var err error
+    b.closeOnce.Do(func() {
+        b.closed.Store(true)
+        close(b.closing)
+        <-b.rxCh // reader 退出时关闭 rxCh
+        if s := b.adapt.Uninitialize(b.ch); s != raw.PCAN_ERROR_OK {
+            err = wrapStatus(b.adapt, "CAN_Uninitialize", s)
+        }
+        close(b.errCh)
+    })
+    return err
+}
+```
+
+- 新增 `ReadOne` / `TryRead`：
+
+```go
+func (b *Bus) ReadOne(ctx context.Context) (Frame, error) {
+    select {
+    case f, ok := <-b.rxCh:
+        if !ok {
+            return Frame{}, ErrBusClosed
+        }
+        return f, nil
+    case <-ctx.Done():
+        return Frame{}, ctx.Err()
+    }
+}
+
+func (b *Bus) TryRead() (Frame, error) {
+    select {
+    case f, ok := <-b.rxCh:
+        if !ok {
+            return Frame{}, ErrBusClosed
+        }
+        return f, nil
+    default:
+        return Frame{}, ErrQueueEmpty
+    }
+}
+```
+
+### Task 4.2：bus_test.go 新增 reader 测试
+
+追加：
+
+```go
+func TestReader_SuppressQRCVEMPTY(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f, WithPollInterval(2*time.Millisecond))
+    defer bus.Close()
+
+    time.Sleep(20 * time.Millisecond)
+
+    select {
+    case e := <-bus.Errors():
+        t.Fatalf("errCh should not receive QRCVEMPTY: %v", e)
+    default:
+    }
+}
+
+func TestReader_DrainsQueue(t *testing.T) {
+    f := newFakeAdapter()
+    for i := 0; i < 5; i++ {
+        f.push(raw.TPCANMsg{ID: uint32(0x100 + i), Len: 1, Data: [8]byte{byte(i)}})
+    }
+    bus := openTest(t, f, WithPollInterval(time.Millisecond))
+    defer bus.Close()
+
+    got := 0
+    deadline := time.After(500 * time.Millisecond)
+    for got < 5 {
+        select {
+        case fr := <-bus.Receive():
+            if fr.ID != uint32(0x100+got) {
+                t.Errorf("ID[%d] = 0x%X", got, fr.ID)
+            }
+            got++
+        case <-deadline:
+            t.Fatalf("timeout after %d frames", got)
+        }
+    }
+}
+
+func TestReadOne_OK(t *testing.T) {
+    f := newFakeAdapter()
+    f.push(raw.TPCANMsg{ID: 0x123, Len: 2, Data: [8]byte{1, 2}})
+    bus := openTest(t, f, WithPollInterval(time.Millisecond))
+    defer bus.Close()
+
+    fr, err := bus.ReadOne(context.Background())
+    if err != nil {
+        t.Fatal(err)
+    }
+    if fr.ID != 0x123 || len(fr.Data) != 2 {
+        t.Errorf("bad frame: %+v", fr)
+    }
+}
+
+func TestReadOne_CtxCancel(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f, WithPollInterval(50*time.Millisecond))
+    defer bus.Close()
+
+    ctx, cancel := context.WithCancel(context.Background())
+    cancel()
+    _, err := bus.ReadOne(ctx)
+    if !errors.Is(err, context.Canceled) {
+        t.Errorf("got %v, want context.Canceled", err)
+    }
+}
+
+func TestTryRead_Empty(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f, WithPollInterval(50*time.Millisecond))
+    defer bus.Close()
+    _, err := bus.TryRead()
+    if !errors.Is(err, ErrQueueEmpty) {
+        t.Errorf("got %v, want ErrQueueEmpty", err)
+    }
+}
+
+func TestReceive_AfterClose(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    bus.Close()
+
+    fr, ok := <-bus.Receive()
+    if ok {
+        t.Errorf("expected closed channel, got frame %+v", fr)
+    }
+}
+
+func TestConcurrent_SendReceive(t *testing.T) {
+    f := newFakeAdapter()
+    for i := 0; i < 50; i++ {
+        f.push(raw.TPCANMsg{ID: uint32(i), Len: 1, Data: [8]byte{byte(i)}})
+    }
+    bus := openTest(t, f, WithPollInterval(time.Millisecond))
+    defer bus.Close()
+
+    done := make(chan struct{})
+    go func() {
+        for i := 0; i < 50; i++ {
+            fr, _ := NewFrame(uint32(i), []byte{byte(i)})
+            _ = bus.Send(context.Background(), fr)
+        }
+        close(done)
+    }()
+    received := 0
+    deadline := time.After(1 * time.Second)
+    for received < 50 {
+        select {
+        case <-bus.Receive():
+            received++
+        case <-deadline:
+            t.Fatalf("only got %d frames", received)
+        }
+    }
+    <-done
+}
+```
+
+- [ ] **Step：跑 + commit**
+
+```bash
+go test -race ./... -v
+git add reader.go bus.go bus_test.go
+git commit -m "feat: add reader goroutine with Polling mode + ReadOne/TryRead"
+```
+
+### 阶段 4 出口条件
+
+- 全部测试 `-race` 通过
+- `Receive` / `ReadOne` / `TryRead` 工作
+- QRCVEMPTY 不进 errCh
+- Close 流程：先等 reader 退出再 Uninitialize
+
+---
+
+## 阶段 5：Event 模式 + SetFilter（需要 SetValue/FilterMessages）
+
+**目标**：完善阶段 4 的 Polling 默认；增加 Event 模式（Windows 真实路径）；
+加 SetFilter / ResetFilter。
+
+### Task 5.1：adapter 接口扩展
+
+**Files:**
+- Modify: `adapter.go`
+
+`rawAdapter` 增加：
+
+```go
+SetValue(ch raw.TPCANHandle, p raw.TPCANParameter, buf unsafe.Pointer, n uint32) raw.TPCANStatus
+GetValue(ch raw.TPCANHandle, p raw.TPCANParameter, buf unsafe.Pointer, n uint32) raw.TPCANStatus
+FilterMessages(ch raw.TPCANHandle, fromID, toID uint32, mode raw.TPCANMessageType) raw.TPCANStatus
+```
+
+`liveAdapter` 同步包装。`fakeAdapter` 同步加上记录 + 可配置返回。
+
+### Task 5.2：Event 模式实现
+
+**Files:**
+- Create: `event_windows.go`
+- Create: `event_other.go`
+- Modify: `bus.go` / `reader.go`
+
+`event_windows.go`：
+
+```go
+//go:build windows
+
+package pcanbasic
+
+import (
+    "fmt"
+    "unsafe"
+
+    "github.com/Crush251/pcanbasic_go/raw"
+    "golang.org/x/sys/windows"
+)
+
+// setupEventHandle 注册 PCAN 接收事件，返回 Windows event handle。
+// 失败时返回 (0, err)。
+func (b *Bus) setupEventHandle() (windows.Handle, error) {
+    h, err := windows.CreateEvent(nil, 0, 0, nil)
+    if err != nil {
+        return 0, fmt.Errorf("CreateEvent: %w", err)
+    }
+    handle := uint32(h)
+    s := b.adapt.SetValue(b.ch, raw.PCAN_RECEIVE_EVENT,
+        unsafe.Pointer(&handle), uint32(unsafe.Sizeof(handle)))
+    if s != raw.PCAN_ERROR_OK {
+        _ = windows.CloseHandle(h)
+        return 0, wrapStatus(b.adapt, "CAN_SetValue(PCAN_RECEIVE_EVENT)", s)
+    }
+    return h, nil
+}
+
+func waitOnEvent(h windows.Handle, abort windows.Handle) bool {
+    handles := []windows.Handle{h, abort}
+    r, err := windows.WaitForMultipleObjects(handles, false, windows.INFINITE)
+    if err != nil {
+        return false
+    }
+    // r == WAIT_OBJECT_0 → 接收事件；r == WAIT_OBJECT_0+1 → abort
+    return r == 0
+}
+```
+
+`event_other.go`：
+
+```go
+//go:build !windows
+
+package pcanbasic
+
+// 非 Windows 平台没有真正的 Event 模式；统一退回 Polling。
+// 这里仅占位以保证 reader.go 在所有平台编译通过。
+
+type eventHandle struct{}
+
+func (b *Bus) setupEventHandle() (eventHandle, error) {
+    return eventHandle{}, ErrNotSupported
+}
+```
+
+`bus.go` 修改：
+
+- `Bus` 增加 `eventHandle` 字段（Windows: `windows.Handle`；其他平台：`eventHandle{}`）
+- 增加 `abortHandle`（Windows: `windows.CreateEvent` 用作 Close 唤醒信号）
+- `openWith` 根据 `cfg.receiveMode` 决定：
+  - `ModePolling` → 直接走 Polling
+  - `ModeEvent` → `setupEventHandle()`；失败返回错误
+  - `ModeAuto` → 先尝试 Event，失败则 `cfg.logger.Infof(...)` 并降级 Polling
+- `Close` 流程：Event 模式下 `SetEvent(abortHandle)` 唤醒 reader
+
+`reader.go` `waitForData`：分平台实现（Windows Event 路径见上）。
+
+### Task 5.3：SetFilter / ResetFilter
+
+**Files:**
+- Modify: `bus.go`
+
+```go
+// SetFilter 设置消息过滤范围（PCAN 默认是开放的，本方法用于收窄）。
+// idMin/idMax 是要接受的 ID 范围（闭区间）；mode 区分 11 位 / 29 位 ID。
+func (b *Bus) SetFilter(idMin, idMax uint32, mode FilterMode) error {
+    if b.closed.Load() {
+        return ErrBusClosed
+    }
+    var mt raw.TPCANMessageType
+    if mode == FilterExtended {
+        mt = raw.PCAN_MESSAGE_EXTENDED
+    }
+    s := b.adapt.FilterMessages(b.ch, idMin, idMax, mt)
+    if s != raw.PCAN_ERROR_OK {
+        return wrapStatus(b.adapt, "CAN_FilterMessages", s)
+    }
+    return nil
+}
+
+// ResetFilter 恢复"接收全部"。
+// 实现方式：用 SetValue(PCAN_MESSAGE_FILTER, PCAN_FILTER_OPEN) 打开滤波器。
+func (b *Bus) ResetFilter() error {
+    if b.closed.Load() {
+        return ErrBusClosed
+    }
+    v := uint32(raw.PCAN_FILTER_OPEN)
+    s := b.adapt.SetValue(b.ch, raw.PCAN_MESSAGE_FILTER,
+        unsafe.Pointer(&v), uint32(unsafe.Sizeof(v)))
+    if s != raw.PCAN_ERROR_OK {
+        return wrapStatus(b.adapt, "CAN_SetValue(MESSAGE_FILTER=OPEN)", s)
+    }
+    return nil
+}
+```
+
+`import "unsafe"` 需要加到 `bus.go`。
+
+### Task 5.4：filter_test.go
+
+**Files:**
+- Append to `bus_test.go`
+
+```go
+func TestSetFilter_CallsFilterMessages(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    defer bus.Close()
+    if err := bus.SetFilter(0x100, 0x1FF, FilterStandard); err != nil {
+        t.Fatal(err)
+    }
+    // 验证调用次数与参数（需要在 fake 里加 lastFilter 记录字段）
+}
+
+func TestResetFilter_CallsSetValue(t *testing.T) {
+    f := newFakeAdapter()
+    bus := openTest(t, f)
+    defer bus.Close()
+    if err := bus.ResetFilter(); err != nil {
+        t.Fatal(err)
+    }
+    // 验证 SetValue 被调用
+}
+```
+
+`fakeAdapter` 同步加 `lastFilterFrom/To/Mode`、`lastSetValueParam` 等字段。
+
+- [ ] **Step：跑 + commit**
+
+```bash
+go test -race ./... -v
+git add adapter.go event_windows.go event_other.go bus.go reader.go adapter_fake_test.go bus_test.go
+git commit -m "feat: add Event receive mode and SetFilter/ResetFilter"
+```
+
+### 阶段 5 出口条件
+
+- 全部测试通过
+- Linux 上 Event 模式自动降级 Polling
+- SetFilter / ResetFilter 工作
+
+---
+
+## 阶段 6：示例与文档
+
+### Task 6.1：10 个示例（每个 1 文件 main.go）
+
+为节省篇幅，下列模式适用于所有示例：
+
+- 文件头中文注释：用途、前置条件、运行命令
+- ≤ 100 行
+- `log.Fatal` 仅用于演示流程（注释中说明生产中应做更精细错误处理）
+- 真实运行需要 Windows + PCAN-USB + DLL；Linux 编译可过但 Open 会失败
+
+**示例文件清单与每个示例的目标**：
+
+| # | 路径 | 演示点 |
+|---|---|---|
+| 01 | `examples/01_send_classical/main.go` | `Open` + `Send` |
+| 02 | `examples/02_receive_polling/main.go` | `WithReceiveMode(ModePolling)` + `Receive` |
+| 03 | `examples/03_receive_event/main.go` | `WithReceiveMode(ModeEvent)` + `Receive` |
+| 04 | `examples/04_send_fd/main.go` | `OpenFD` + `NewFDFrame(brs=true)` |
+| 05 | `examples/05_receive_fd/main.go` | `OpenFD` + 接收 FD 帧 |
+| 06 | `examples/06_multi_channel/main.go` | 同时操作 USBBus1+USBBus2 |
+| 07 | `examples/07_filter/main.go` | `SetFilter` / `ResetFilter` |
+| 08 | `examples/08_status_and_reset/main.go` | `Status` 监测 + BUSOFF 时 `Reset` |
+| 09 | `examples/09_with_logger/main.go` | 用 slog 适配 Logger 接口 |
+| 10 | `examples/10_using_raw/main.go` | 直接调 `raw.GetValue(PCAN_API_VERSION,...)` |
+
+示例 01（模板，其他依此类推）：
+
+```go
+// 运行: go run ./examples/01_send_classical -channel=USBBus1
+// 前置: Windows + PCAN-USB + 已放置 PCANBasic.dll
+//
+// 本示例演示如何打开 Classical CAN 通道并发送一帧报文。
+
+package main
+
+import (
+    "context"
+    "flag"
+    "log"
+
+    "github.com/Crush251/pcanbasic_go"
+)
+
+func main() {
+    chName := flag.String("channel", "USBBus1", "channel name (USBBus1..USBBus16)")
+    flag.Parse()
+
+    ch, ok := lookupChannel(*chName)
+    if !ok {
+        log.Fatalf("unknown channel: %s", *chName)
+    }
+
+    bus, err := pcanbasic.Open(ch, pcanbasic.WithBitrate(pcanbasic.Baud1M))
+    if err != nil {
+        log.Fatalf("open: %v", err)
+    }
+    defer bus.Close()
+
+    frame, err := pcanbasic.NewFrame(0x123, []byte{0x01, 0x02, 0x03, 0x04})
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := bus.Send(context.Background(), frame); err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("sent: id=0x%X data=%X", frame.ID, frame.Data)
+}
+
+func lookupChannel(name string) (pcanbasic.Channel, bool) {
+    switch name {
+    case "USBBus1":  return pcanbasic.USBBus1, true
+    case "USBBus2":  return pcanbasic.USBBus2, true
+    case "USBBus3":  return pcanbasic.USBBus3, true
+    case "USBBus4":  return pcanbasic.USBBus4, true
+    case "USBBus5":  return pcanbasic.USBBus5, true
+    case "USBBus6":  return pcanbasic.USBBus6, true
+    case "USBBus7":  return pcanbasic.USBBus7, true
+    case "USBBus8":  return pcanbasic.USBBus8, true
+    case "USBBus9":  return pcanbasic.USBBus9, true
+    case "USBBus10": return pcanbasic.USBBus10, true
+    case "USBBus11": return pcanbasic.USBBus11, true
+    case "USBBus12": return pcanbasic.USBBus12, true
+    case "USBBus13": return pcanbasic.USBBus13, true
+    case "USBBus14": return pcanbasic.USBBus14, true
+    case "USBBus15": return pcanbasic.USBBus15, true
+    case "USBBus16": return pcanbasic.USBBus16, true
+    }
+    return 0, false
+}
+```
+
+> 由于每个示例独立 main，`lookupChannel` 在每个示例里复制粘贴一份（YAGNI；不为
+> 示例搞共享 helper 包，避免示例之间隐式耦合，妨碍读者剪贴）。
+
+### Task 6.2：文档文件
+
+**Files:**
+- Create: `docs/quickstart.md`
+- Create: `docs/architecture.md`
+- Create: `docs/can-fd.md`
+- Create: `docs/error-handling.md`
+- Create: `docs/platform-support.md`
+- Create: `docs/hardware-test-setup.md`
+- Create: `docs/troubleshooting.md`
+
+每个文档的核心要点（计划级，不在此重复全文，写时按 spec §6 + 各章节决策展开）：
+
+- **quickstart**：3 步跑通；安装驱动 → 放 DLL → `examples/01` 一行 `go run`
+- **architecture**：双层结构图、reader goroutine 单读模型、Close 流程时序图
+- **can-fd**：fdBitrate 字符串格式举例、DLC 离散表、BRS/ESI 含义
+- **error-handling**：`Error` 结构、`errors.Is` 用法、典型 BUSOFF → Reset 模式
+- **platform-support**：架构匹配表、`PCANBASIC_DLL_PATH` 用法、非 Windows 行为
+- **hardware-test-setup**：驱动安装、DLL 放置、`go test -tags=pcanhardware ./...`
+- **troubleshooting**：DLL 找不到、0x08000 ILLPARAMVAL、初始化已占用 0x4000000 INITIALIZE、BUSOFF 恢复（含 FAQ 段）
+
+### Task 6.3：CI
+
+**Files:**
+- Create: `.github/workflows/ci.yml`
+
+```yaml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v6
+        with: { version: latest }
+      - run: go test -race ./...
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - run: go vet ./...
+      - run: go test ./...
+```
+
+`.golangci.yml`：
+
+```yaml
+run:
+  timeout: 5m
+linters:
+  enable:
+    - gofmt
+    - govet
+    - staticcheck
+    - revive
+    - errcheck
+    - ineffassign
+    - misspell
+    - unused
+```
+
+- [ ] **Step：commit**
+
+```bash
+git add examples/ docs/quickstart.md docs/architecture.md docs/can-fd.md \
+        docs/error-handling.md docs/platform-support.md docs/hardware-test-setup.md \
+        docs/troubleshooting.md .github/workflows/ci.yml .golangci.yml
+git commit -m "docs+examples: add quickstart/architecture/troubleshooting docs and 10 examples"
+```
+
+---
+
+## 阶段 7：CHANGELOG 收口 + 版本标记
+
+### Task 7.1：CHANGELOG 收口
+
+**Files:**
+- Modify: `CHANGELOG.md`
+
+把 `[Unreleased]` 改名为 `[0.1.0] - 2026-05-22`，包括完整 Added 列表（按 spec §6.4 内容）。
+
+- [ ] **Step：commit + tag**
+
+```bash
+git add CHANGELOG.md
+git commit -m "release: v0.1.0"
+git tag -a v0.1.0 -m "v0.1.0: initial release"
+```
+
+---
+
+## 自检（写完之后再过一遍）
+
+**Spec 覆盖**：
+
+| Spec § | 实现位置 |
+|---|---|
+| §3.1 Frame | Task 2.4 |
+| §3.2 Bus | Task 3.2 / 4.1 / 5.3 |
+| §3.3 Option | Task 2.6 |
+| §3.4 Channel/Bitrate | Task 2.6 |
+| §3.5 Error / Status / SendManyError | Task 2.1 / 2.3 |
+| §3.6 raw 子包 | 阶段 1 |
+| §4 接收模型 | 阶段 4 + 5 |
+| §5 测试策略 | 各阶段单测 + Task 3.3 fakeAdapter |
+| §6 文档与示例 | Task 6.1 / 6.2 |
+| §7 CI | Task 6.3 |
+
+**无占位**：每个 Task 都有完整代码片段或明确文件列表。
+**类型一致**：`rawAdapter` 在 Task 3.1 定义，Task 5.1 扩展（追加 3 方法）；
+高层 API 命名贯穿一致（`Receive` / `ReadOne` / `TryRead` / `SendMany` / `Status` / `Reset` / `SetFilter` / `ResetFilter`）。
