@@ -517,8 +517,13 @@ func TestReader_PropagatesPCANError(t *testing.T) {
 	// 这里用一个 fakeAdapter 子类型不方便，直接修改 read 路径太重，
 	// 改用：先 push 正常帧让 reader 取走，再切换 statusReturn 不会改变 Read 行为；
 	// 简单做法：直接构造一种 adapter 让 Read 返回 BUSOFF。
+	//
+	// 强制 ModePolling：windows 上 ModeAuto + errInjectingAdapter.SetValue 返回 OK
+	// 会启用 Event 模式，但 fake 不会 SetEvent，reader 卡在 WaitForMultipleObjects。
 	f := &errInjectingAdapter{readErr: raw.PCAN_ERROR_BUSOFF}
-	bus, err := openWith(f, USBBus1, false, "", WithPollInterval(time.Millisecond))
+	bus, err := openWith(f, USBBus1, false, "",
+		WithReceiveMode(ModePolling),
+		WithPollInterval(time.Millisecond))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
